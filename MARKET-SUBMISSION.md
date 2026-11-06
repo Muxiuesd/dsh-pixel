@@ -7,7 +7,7 @@
 | 通道 | 状态 | 卡在哪 |
 |---|---|---|
 | npm | ✅ 已上线 `0.1.1`（latest） | — |
-| 社区目录（6000+，`dshm_search` 来源之一） | 🟡 PR 已提交 [#12712](https://github.com/awesome-dsh-plugin/awesome-dsh-plugin/pull/12712) | CI 在跑；年龄闸门北京时间 2026-11-07 21:20 满足，自动重跑在 2026-11-08 02:19（`regate` cron `19 */6 * * *`），之后等合并 |
+| 社区目录（6000+，`dshm_search` 来源之一） | 🟡 PR [#12712](https://github.com/awesome-dsh-plugin/awesome-dsh-plugin/pull/12712) 已提交，`check` 绿 / `Submission gate` 红（唯一问题=仓库年龄） | `repository is 0.1 days old (needs 1) — … should clear in about 23h`；北京时间 2026-11-07 21:20 满足，`regate` cron（11-07 `18:19Z` ≈ 北京 11-08 02:20）自动转绿，之后等合并 |
 | 精选清单（33 条手工收录） | ❌ 未收录 | 还没给 `iasiv5/dsh-m` 提 `registry.json` PR |
 
 已核实的四条事实：
@@ -83,6 +83,8 @@ icon: https://raw.githubusercontent.com/Muxiuesd/dsh-pixel/main/icon.png
 | 仓库未被归档 | ✅ |
 | `package.json` 声明 `dsh.bundle` | ✅ `dsh.bundle.patch: ./cordis.patch.yml` + `dsh.client.platform: web`（已用 GitHub API 核对 main 分支上的文件） |
 | 仓库创建满 **1 天** | ⏳ 建于 `2026-11-06T13:20:38Z` → 北京时间 **2026-11-07 21:20** 起满足 |
+
+**实际闸门输出**（PR #12712，2026-11-06T15:2xZ）：`check` = success；`Submission gate` = failure，报错正文只有一条 —— `repository is 0.1 days old (needs 1) — nothing to do: this check re-runs by itself and should clear in about 23h. No need to resubmit, push, or close and reopen; the age bar is the only thing failing here.` 即另外两条（未归档、`dsh.bundle`）都已通过。
 
 第三条的正确处理（脚本注释原话）：这是唯一「时间一到自动变绿」的失败项，`regate.yml` 每 6 小时重跑一次并匹配 `/days old/` 那条文案 → **照常提 PR 就好**，不要关掉重开、不要空提交。注意重跑不是每秒都发生：cron 是 `19 */6 * * *`（UTC 00:19 / 06:19 / 12:19 / 18:19），仓库在 11-07 `13:20Z` 才满一天，所以真正的自动转绿发生在 **11-07 `18:19Z` 那一轮 ≈ 北京时间 11-08 02:20**；想早点看结果就只能自己 push 一次或手动 `workflow_dispatch` 触发（不推荐，空提交会被记档）。
 
