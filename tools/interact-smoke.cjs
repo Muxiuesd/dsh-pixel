@@ -1,4 +1,4 @@
-﻿/**
+/**
  * Interaction smoke test for the Pixel Studio client module.
  *
  * render-smoke.cjs only proves the *first* render builds. This harness adds a
@@ -14,7 +14,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
 
-const CLIENT = path.resolve(__dirname, '..', 'dsh-pixel-studio', 'client.js');
+const CLIENT = path.resolve(__dirname, '..', 'client.js');
 
 /* -------------------------------------------------------------------------- */
 /* browser + host stubs                                                       */

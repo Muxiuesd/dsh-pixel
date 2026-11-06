@@ -9,8 +9,7 @@
   "author": "Muxiuesd",
   "repository": {
     "type": "git",
-    "url": "git+https://gitee.com/muxiuesd12138/dsh-pixel.git",
-    "directory": "dsh-pixel-studio"
+    "url": "git+https://gitee.com/muxiuesd12138/dsh-pixel.git"
   },
   "homepage": "https://gitee.com/muxiuesd12138/dsh-pixel",
   "publishConfig": {

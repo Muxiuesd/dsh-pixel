@@ -7,7 +7,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
 
-const file = path.join(__dirname, '..', 'dsh-pixel-studio', 'client.js');
+const file = path.join(__dirname, '..', 'client.js');
 const source = fs.readFileSync(file, 'utf8');
 
 const start = source.indexOf('/** Does any layer still reference this palette slot? */');

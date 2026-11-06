@@ -8,10 +8,12 @@
 
 ```bash
 # 1) 官方插件管理页 / 插件市场里搜索 @muxiuesd/dsh-pixel-studio
-# 2) DSH CLI
+# 2) DSH CLI（npm）
 dsh plugin --profile web add @muxiuesd/dsh-pixel-studio
-# 3) 本地开发（包目录本身就是插件）
-dsh plugin --profile web add /绝对路径/dsh-pixel-studio
+# 3) 直接从 GitHub 仓库装（仓库根就是插件包）
+dsh plugin --profile web add github:Muxiuesd/dsh-pixel
+# 4) 本地开发
+dsh plugin --profile web add /绝对路径/dsh-pixel
 ```
 
 ## 能做什么
@@ -52,4 +54,4 @@ dsh plugin --profile web add /绝对路径/dsh-pixel-studio
 
 MIT © 2026 Muxiuesd
 
-源码与问题反馈：<https://gitee.com/muxiuesd12138/dsh-pixel>
+源码与问题反馈：<https://gitee.com/muxiuesd12138/dsh-pixel>（GitHub 镜像：<https://github.com/Muxiuesd/dsh-pixel>）
