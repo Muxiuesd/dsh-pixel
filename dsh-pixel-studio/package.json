@@ -1,0 +1,60 @@
+{
+  "name": "@muxiuesd/dsh-pixel-studio",
+  "version": "0.1.1",
+  "description": "在 DSH 里画像素画：三栏编辑器（左工具 / 中画布 / 右调色板），滚轮缩放，图层、调色板、导出 PNG 都在会话页签里。",
+  "type": "module",
+  "main": "./index.js",
+  "icon": "./icon.png",
+  "license": "MIT",
+  "author": "Muxiuesd",
+  "repository": {
+    "type": "git",
+    "url": "git+https://gitee.com/Muxiuesd/dsh-pixel-studio.git",
+    "directory": "dsh-pixel-studio"
+  },
+  "homepage": "https://gitee.com/Muxiuesd/dsh-pixel-studio",
+  "publishConfig": {
+    "access": "public"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "pixel-art",
+    "pixel-editor"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.png",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "locale",
+    "icon.png"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-runtime",
+        "@deepseek-ai/dsh-client-ui-slots"
+      ]
+    }
+  },
+  "peerDependencies": {
+    "react": "^18.2.0 || ^19.0.0"
+  }
+}

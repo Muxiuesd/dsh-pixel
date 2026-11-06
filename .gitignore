@@ -1,0 +1,12 @@
+# 依赖与构建产物
+node_modules/
+
+# 本地导出的图片与冒烟测试产物
+out/
+qwe*.png
+*.log
+
+# 编辑器/系统杂项
+.DS_Store
+Thumbs.db
+.vscode/
