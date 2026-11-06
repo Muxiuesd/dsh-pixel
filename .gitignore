@@ -10,3 +10,6 @@ qwe*.png
 .DS_Store
 Thumbs.db
 .vscode/
+
+# 临时抓取的 CI 脚本 / 工作流副本
+.tmp/

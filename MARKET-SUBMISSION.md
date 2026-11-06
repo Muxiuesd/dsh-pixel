@@ -7,7 +7,7 @@
 | 通道 | 状态 | 卡在哪 |
 |---|---|---|
 | npm | ✅ 已上线 `0.1.1`（latest） | — |
-| 社区目录（6000+，`dshm_search` 来源之一） | 🟡 PR 已提交 [#12712](https://github.com/awesome-dsh-plugin/awesome-dsh-plugin/pull/12712) | CI 在跑；「仓库满 1 天」那条北京时间 2026-11-07 21:20 自动转绿，之后等合并 |
+| 社区目录（6000+，`dshm_search` 来源之一） | 🟡 PR 已提交 [#12712](https://github.com/awesome-dsh-plugin/awesome-dsh-plugin/pull/12712) | CI 在跑；年龄闸门北京时间 2026-11-07 21:20 满足，自动重跑在 2026-11-08 02:19（`regate` cron `19 */6 * * *`），之后等合并 |
 | 精选清单（33 条手工收录） | ❌ 未收录 | 还没给 `iasiv5/dsh-m` 提 `registry.json` PR |
 
 已核实的四条事实：
@@ -15,7 +15,7 @@
 - 本机同步的社区目录快照 `catalog-2026.1106.16122.json`（12 MB，今天 18:36 拉取）里搜 `muxiuesd` → **0 命中**；快照构建时间早于发布（22:18），本来也不可能包含。
 - `Muxiuesd/dsh-pixel` 的 topics 已加齐（`dsh-plugin` 等 6 个），GitHub 搜索 `topic:dsh-plugin user:Muxiuesd` **total=1** —— 准入条件已满足。
 - 但社区目录**不是**靠 topic 自动抓取的（早先的判断需要更正）：条目是 `data/plugins/*.yml` 里一行一行 PR 进去的，README 与 npm 目录都是从那批 YAML 生成的。
-- 仓库建于 `2026-11-06T13:20:38Z`，CI 有一条「仓库满 1 天」的闸门，**北京时间 2026-11-07 21:20 自动转绿**（`regate.yml` 每 6 小时重跑），不需要重提。
+- 仓库建于 `2026-11-06T13:20:38Z`，CI 有一条「仓库满 1 天」的闸门：北京时间 **2026-11-07 21:20** 起满足，但要等 `regate.yml` 那一轮 cron（11-07 `18:19Z` ≈ 北京 11-08 02:20）才会自动转绿，不需要重提。
 
 ---
 
@@ -82,9 +82,11 @@ icon: https://raw.githubusercontent.com/Muxiuesd/dsh-pixel/main/icon.png
 |---|---|
 | 仓库未被归档 | ✅ |
 | `package.json` 声明 `dsh.bundle` | ✅ `dsh.bundle.patch: ./cordis.patch.yml` + `dsh.client.platform: web`（已用 GitHub API 核对 main 分支上的文件） |
-| 仓库创建满 **1 天** | ⏳ 建于 `2026-11-06T13:20:38Z` → **北京时间 2026-11-07 21:20** 自动转绿 |
+| 仓库创建满 **1 天** | ⏳ 建于 `2026-11-06T13:20:38Z` → 北京时间 **2026-11-07 21:20** 起满足 |
 
-第三条的正确处理（脚本注释原话）：这是唯一「时间一到自动变绿」的失败项，`regate.yml` 每 6 小时重跑一次并匹配 `/days old/` 那条文案 → **照常提 PR 就好**，不要关掉重开、不要空提交。CI 会先显示一条红叉，约 23 小时后自己消失，不需要重提。
+第三条的正确处理（脚本注释原话）：这是唯一「时间一到自动变绿」的失败项，`regate.yml` 每 6 小时重跑一次并匹配 `/days old/` 那条文案 → **照常提 PR 就好**，不要关掉重开、不要空提交。注意重跑不是每秒都发生：cron 是 `19 */6 * * *`（UTC 00:19 / 06:19 / 12:19 / 18:19），仓库在 11-07 `13:20Z` 才满一天，所以真正的自动转绿发生在 **11-07 `18:19Z` 那一轮 ≈ 北京时间 11-08 02:20**；想早点看结果就只能自己 push 一次或手动 `workflow_dispatch` 触发（不推荐，空提交会被记档）。
+
+闸门实际分两段跑：`pr-check.yml`（fork 侧、无 token，跑 lint/build）+ `pr-gate.yml`（`workflow_run` 触发、在基仓库上下文里带 token 跑 `check-submission.mjs`）。所以 PR 页面上会先看到 `check`，结束后再出现提交闸门那条。旧的 `MIN_COMMITS = 10` 提交数下限在 2026-09-03 已删除（#4196），现在只剩上面三条。
 
 ### PR 标题与正文
 
