@@ -14,7 +14,8 @@
   },
   "homepage": "https://gitee.com/muxiuesd12138/dsh-pixel",
   "publishConfig": {
-    "access": "public"
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
   },
   "keywords": [
     "dsh",
