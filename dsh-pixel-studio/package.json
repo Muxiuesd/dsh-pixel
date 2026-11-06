@@ -9,10 +9,10 @@
   "author": "Muxiuesd",
   "repository": {
     "type": "git",
-    "url": "git+https://gitee.com/Muxiuesd/dsh-pixel-studio.git",
+    "url": "git+https://gitee.com/muxiuesd12138/dsh-pixel.git",
     "directory": "dsh-pixel-studio"
   },
-  "homepage": "https://gitee.com/Muxiuesd/dsh-pixel-studio",
+  "homepage": "https://gitee.com/muxiuesd12138/dsh-pixel",
   "publishConfig": {
     "access": "public"
   },

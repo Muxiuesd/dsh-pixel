@@ -52,4 +52,4 @@ dsh plugin --profile web add /绝对路径/dsh-pixel-studio
 
 MIT © 2026 Muxiuesd
 
-源码与问题反馈：<https://gitee.com/Muxiuesd/dsh-pixel-studio>
+源码与问题反馈：<https://gitee.com/muxiuesd12138/dsh-pixel>
