@@ -65,6 +65,18 @@ window.__ModuleLoader__.load({
         ];
         /** Keep in sync with MAX_SIDE in index.js. */
         const MAX_SIDE = 256;
+        /** Keep in sync with MAX_EXPORT_PIXELS in index.js. */
+        const MAX_EXPORT_PIXELS = 4096 * 4096;
+        /** Magnifications offered by the Save-as dialog. */
+        const EXPORT_SCALES = [1, 2, 3, 4, 6, 8, 12, 16];
+        /** One character per palette slot, so an import can never use more colours than this. */
+        const IMPORT_MAX_COLORS = CHARS.length;
+        /** Where existing content sits when the canvas grows or shrinks. */
+        const ANCHORS = [
+            { id: 'nw', label: '↖' }, { id: 'n', label: '↑' }, { id: 'ne', label: '↗' },
+            { id: 'w', label: '←' }, { id: 'c', label: '·' }, { id: 'e', label: '→' },
+            { id: 'sw', label: '↙' }, { id: 's', label: '↓' }, { id: 'se', label: '↘' },
+        ];
 
         const TOOLS = [
             { id: 'pencil', label: '铅笔', key: 'B', icon: 'pencil' },
@@ -347,6 +359,323 @@ window.__ModuleLoader__.load({
         }
 
         /* ------------------------------------------------------------------ */
+        /* canvas resize                                                      */
+        /* ------------------------------------------------------------------ */
+
+        /** Undo snapshot; width/height ride along so a canvas resize can be undone. */
+        function snapshotOf(doc) {
+            return {
+                palette: doc.palette.slice(),
+                layers: doc.layers.map((layer) => ({ ...layer, rows: layer.rows.slice() })),
+                w: doc.w,
+                h: doc.h,
+            };
+        }
+
+        /** Offset that keeps existing pixels at the chosen anchor when the canvas changes size. */
+        function anchorOffsets(anchor, oldWidth, oldHeight, newWidth, newHeight) {
+            const id = typeof anchor === 'string' && anchor.length > 0 ? anchor : 'c';
+            const dx = id.includes('w') ? 0
+                : id.includes('e') ? newWidth - oldWidth
+                    : Math.round((newWidth - oldWidth) / 2);
+            const dy = id.includes('n') ? 0
+                : id.includes('s') ? newHeight - oldHeight
+                    : Math.round((newHeight - oldHeight) / 2);
+            return [dx, dy];
+        }
+
+        /** Re-frames one layer onto a new canvas: grown areas become transparent, cropped pixels go away. */
+        function resizeRows(rows, oldWidth, oldHeight, newWidth, newHeight, anchor) {
+            const [dx, dy] = anchorOffsets(anchor, oldWidth, oldHeight, newWidth, newHeight);
+            const next = [];
+            for (let y = 0; y < newHeight; y += 1) {
+                const sourceY = y - dy;
+                const row = sourceY >= 0 && sourceY < oldHeight ? String(rows[sourceY] === undefined ? '' : rows[sourceY]) : '';
+                let line = '';
+                for (let x = 0; x < newWidth; x += 1) {
+                    const sourceX = x - dx;
+                    const ch = sourceX >= 0 && sourceX < oldWidth ? row[sourceX] : undefined;
+                    line += ch === undefined || ch === '' ? '.' : ch;
+                }
+                next.push(line);
+            }
+            return next;
+        }
+
+        /* ------------------------------------------------------------------ */
+        /* image import                                                       */
+        /* ------------------------------------------------------------------ */
+
+        /** Largest integer magnification whose PNG stays under the host's pixel cap. */
+        function maxScaleFor(width, height) {
+            return Math.max(1, Math.floor(Math.sqrt(MAX_EXPORT_PIXELS / Math.max(1, width * height))));
+        }
+
+        /** Remembered export magnification, clamped to what the host can encode for this canvas. */
+        function clampExportScale(value, width, height) {
+            const wanted = Math.round(Number(value) || 1);
+            if (!Number.isFinite(wanted) || wanted < 1) return 1;
+            const ceiling = Math.min(64, maxScaleFor(width, height));
+            return wanted > ceiling ? ceiling : wanted;
+        }
+
+        function clampByte(value) {
+            const number = Math.round(Number(value) || 0);
+            if (number < 0) return 0;
+            return number > 255 ? 255 : number;
+        }
+
+        function hex2(value) {
+            return clampByte(value).toString(16).padStart(2, '0');
+        }
+
+        function rgbOf(color) {
+            return [Number(color[0]) || 0, Number(color[1]) || 0, Number(color[2]) || 0];
+        }
+
+        function colorDistanceSq(a, b) {
+            const dr = a[0] - b[0];
+            const dg = a[1] - b[1];
+            const db = a[2] - b[2];
+            return dr * dr + dg * dg + db * db;
+        }
+
+        function nearestColorIndex(paletteRgb, color) {
+            let best = 0;
+            let bestDistance = Infinity;
+            for (let i = 0; i < paletteRgb.length; i += 1) {
+                const distance = colorDistanceSq(paletteRgb[i], color);
+                if (distance < bestDistance) {
+                    bestDistance = distance;
+                    best = i;
+                }
+            }
+            return best;
+        }
+
+        /** RGB extent of a colour box: [ranges, channel with the widest range]. */
+        function boxExtent(box) {
+            let minR = 255; let minG = 255; let minB = 255;
+            let maxR = 0; let maxG = 0; let maxB = 0;
+            for (const color of box) {
+                if (color[0] < minR) minR = color[0];
+                if (color[1] < minG) minG = color[1];
+                if (color[2] < minB) minB = color[2];
+                if (color[0] > maxR) maxR = color[0];
+                if (color[1] > maxG) maxG = color[1];
+                if (color[2] > maxB) maxB = color[2];
+            }
+            const ranges = [maxR - minR, maxG - minG, maxB - minB];
+            let channel = 0;
+            if (ranges[1] > ranges[channel]) channel = 1;
+            if (ranges[2] > ranges[channel]) channel = 2;
+            return { ranges, channel, widest: ranges[channel] };
+        }
+
+        function averageColor(box) {
+            let r = 0; let g = 0; let b = 0;
+            for (const color of box) {
+                r += color[0]; g += color[1]; b += color[2];
+            }
+            const count = box.length === 0 ? 1 : box.length;
+            return [Math.round(r / count), Math.round(g / count), Math.round(b / count)];
+        }
+
+        /** Median cut: fold thousands of photo colours into at most `limit` representative ones. */
+        function quantizeColors(colors, limit) {
+            if (colors.length <= limit) return colors.slice();
+            const boxes = [colors.slice()];
+            while (boxes.length < limit) {
+                let index = -1;
+                let score = -1;
+                for (let i = 0; i < boxes.length; i += 1) {
+                    const box = boxes[i];
+                    if (box.length < 2) continue;
+                    const extent = boxExtent(box);
+                    const weight = extent.widest * Math.min(box.length, 256);
+                    if (weight > score) {
+                        score = weight;
+                        index = i;
+                    }
+                }
+                if (index === -1) break;
+                const box = boxes[index];
+                const channel = boxExtent(box).channel;
+                const sorted = box.slice().sort((a, b) => a[channel] - b[channel]);
+                const middle = Math.max(1, Math.floor(sorted.length / 2));
+                boxes.splice(index, 1, sorted.slice(0, middle), sorted.slice(middle));
+            }
+            return boxes.map(averageColor);
+        }
+
+        /** Most common opaque colours of a sampled image, as hex strings plus RGB triples. */
+        function paletteFromSample(sample, limit) {
+            const counts = new Map();
+            const total = sample.width * sample.height;
+            for (let i = 0; i < total; i += 1) {
+                if (sample.data[i * 4 + 3] < 128) continue;
+                const key = (sample.data[i * 4] << 16) | (sample.data[i * 4 + 1] << 8) | sample.data[i * 4 + 2];
+                counts.set(key, (counts.get(key) || 0) + 1);
+            }
+            const ordered = Array.from(counts.entries())
+                .sort((a, b) => b[1] - a[1])
+                .map(([key]) => [Number((key >> 16) & 255), Number((key >> 8) & 255), Number(key & 255)]);
+            const limited = ordered.length > limit ? quantizeColors(ordered, limit) : ordered;
+            const rgb = limited.map((color) => [color[0], color[1], color[2]]);
+            return {
+                palette: rgb.map(([r, g, b]) => `#${hex2(r)}${hex2(g)}${hex2(b)}`),
+                rgb,
+                original: ordered.length,
+            };
+        }
+
+        /** Maps sampled pixels onto the palette; optional Floyd–Steinberg dithering spreads the error. */
+        function buildImportRows(sample, paletteRgb, dither) {
+            const { width, height, data } = sample;
+            const work = new Float32Array(width * height * 3);
+            for (let i = 0; i < width * height; i += 1) {
+                work[i * 3] = data[i * 4];
+                work[i * 3 + 1] = data[i * 4 + 1];
+                work[i * 3 + 2] = data[i * 4 + 2];
+            }
+            const rows = [];
+            const spread = (x, y, error, dx, dy, weight) => {
+                const nx = x + dx;
+                const ny = y + dy;
+                if (nx < 0 || nx >= width || ny >= height) return;
+                const at = ny * width + nx;
+                if (data[at * 4 + 3] < 128) return;
+                work[at * 3] += error[0] * weight;
+                work[at * 3 + 1] += error[1] * weight;
+                work[at * 3 + 2] += error[2] * weight;
+            };
+            for (let y = 0; y < height; y += 1) {
+                let line = '';
+                for (let x = 0; x < width; x += 1) {
+                    const at = y * width + x;
+                    if (data[at * 4 + 3] < 128) {
+                        line += '.';
+                        continue;
+                    }
+                    const color = [work[at * 3], work[at * 3 + 1], work[at * 3 + 2]];
+                    const index = nearestColorIndex(paletteRgb, color);
+                    line += charFor(index);
+                    if (dither) {
+                        const chosen = paletteRgb[index];
+                        const error = [color[0] - chosen[0], color[1] - chosen[1], color[2] - chosen[2]];
+                        spread(x, y, error, 1, 0, 7 / 16);
+                        spread(x, y, error, -1, 1, 3 / 16);
+                        spread(x, y, error, 0, 1, 5 / 16);
+                        spread(x, y, error, 1, 1, 1 / 16);
+                    }
+                }
+                rows.push(line);
+            }
+            return rows;
+        }
+
+        /** PNG data URL of a char grid, shown as the import preview. */
+        function previewDataUrl(palette, rows) {
+            const height = rows.length;
+            const width = height > 0 ? rows[0].length : 0;
+            if (width === 0 || height === 0) return '';
+            const canvas = document.createElement('canvas');
+            canvas.width = width;
+            canvas.height = height;
+            const context = canvas.getContext('2d');
+            if (!context) return '';
+            const image = context.createImageData(width, height);
+            const rgb = palette.map(hexToRgb);
+            for (let y = 0; y < height; y += 1) {
+                const row = rows[y];
+                for (let x = 0; x < width; x += 1) {
+                    const index = indexFor(row === undefined ? '.' : row[x]);
+                    const offset = (y * width + x) * 4;
+                    if (index < 0 || index >= rgb.length) {
+                        image.data[offset + 3] = 0;
+                        continue;
+                    }
+                    image.data[offset] = rgb[index][0];
+                    image.data[offset + 1] = rgb[index][1];
+                    image.data[offset + 2] = rgb[index][2];
+                    image.data[offset + 3] = 255;
+                }
+            }
+            context.putImageData(image, 0, 0);
+            return canvas.toDataURL('image/png');
+        }
+
+        /** Decoded pixels of a picked file, downscaled into the editor's size cap. */
+        async function readImagePixels(file) {
+            const url = window.URL.createObjectURL(file);
+            try {
+                const image = await new Promise((resolve, reject) => {
+                    const element = new window.Image();
+                    element.onload = () => resolve(element);
+                    element.onerror = () => reject(new Error('无法解码这张图片（试 PNG / JPG）'));
+                    element.src = url;
+                });
+                const sourceW = Math.max(1, Math.round(image.naturalWidth || image.width || 1));
+                const sourceH = Math.max(1, Math.round(image.naturalHeight || image.height || 1));
+                const ratio = Math.min(1, MAX_SIDE / Math.max(sourceW, sourceH));
+                const width = Math.max(1, Math.round(sourceW * ratio));
+                const height = Math.max(1, Math.round(sourceH * ratio));
+                const canvas = document.createElement('canvas');
+                canvas.width = width;
+                canvas.height = height;
+                const context = canvas.getContext('2d');
+                if (!context) throw new Error('浏览器不支持读取图片');
+                context.imageSmoothingEnabled = ratio < 1;
+                context.drawImage(image, 0, 0, width, height);
+                const data = context.getImageData(0, 0, width, height).data;
+                return { width, height, sourceW, sourceH, data };
+            } finally {
+                window.URL.revokeObjectURL(url);
+            }
+        }
+
+        function importName(file) {
+            const raw = file && typeof file.name === 'string' ? file.name : '';
+            const stem = raw.replace(/\.[^.]+$/, '').trim();
+            return (stem || '导入的图片').slice(0, 60);
+        }
+
+        /** Rebuilds palette + rows + preview for the current import options. */
+        function buildImportDocument(dialog, currentPalette) {
+            const sample = dialog.sample;
+            let palette;
+            let rgb;
+            let note = '';
+            if (dialog.mode === 'current' && Array.isArray(currentPalette) && currentPalette.length > 0) {
+                palette = currentPalette.slice(0, IMPORT_MAX_COLORS);
+                rgb = palette.map(hexToRgb).map(rgbOf);
+            } else if (dialog.mode === 'pico8') {
+                palette = PRESETS[0].colors.slice(0, IMPORT_MAX_COLORS);
+                rgb = palette.map(hexToRgb).map(rgbOf);
+            } else {
+                const auto = paletteFromSample(sample, IMPORT_MAX_COLORS);
+                palette = auto.palette;
+                rgb = auto.rgb;
+                note = auto.original > palette.length
+                    ? `${auto.original} 种颜色压到 ${palette.length} 种`
+                    : `${auto.original} 种颜色`;
+            }
+            if (palette.length === 0) {
+                palette = ['#000000'];
+                rgb = [[0, 0, 0]];
+            }
+            const rows = buildImportRows(sample, rgb, dialog.dither === true);
+            return {
+                ...dialog,
+                palette,
+                rows,
+                note,
+                preview: previewDataUrl(palette, rows),
+                error: '',
+            };
+        }
+
+        /* ------------------------------------------------------------------ */
         /* icons                                                              */
         /* ------------------------------------------------------------------ */
 
@@ -612,6 +941,42 @@ window.__ModuleLoader__.load({
 }
 .pxs-size-label { font-size: 12px; font-weight: 600; }
 .pxs-size-hint { font-size: 10px; color: var(--dsw-alias-label-secondary, #9aa3b2); }
+.pxs-import-dialog, .pxs-resize-dialog { width: min(460px, calc(100vw - 40px)); }
+.pxs-scale-chip {
+    flex-direction: row; align-items: center; gap: 0; padding: 3px 8px; border-radius: 999px;
+    font-size: 11px; color: var(--dsw-alias-label-primary, #e8ebf2);
+    background: var(--dsw-alias-bg-layer-1, #1c1f26);
+    border: 1px solid var(--dsw-alias-border-l1, rgba(255, 255, 255, .1));
+}
+.pxs-scale-chip:hover { border-color: var(--dsw-alias-border-l2, rgba(255, 255, 255, .2)); }
+.pxs-scale-chip[data-active="true"] {
+    border-color: var(--dsw-alias-brand-primary, #4b7bec);
+    background: color-mix(in srgb, var(--dsw-alias-brand-primary, #4b7bec) 18%, transparent);
+}
+.pxs-scale-chip:disabled { opacity: .45; cursor: not-allowed; }
+.pxs-import-preview {
+    display: flex; justify-content: center; padding: 8px; border-radius: 8px;
+    background: var(--dsw-alias-bg-layer-1, #1c1f26);
+    border: 1px solid var(--dsw-alias-border-l1, rgba(255, 255, 255, .08));
+    max-height: 190px; overflow: auto;
+}
+.pxs-import-preview img {
+    image-rendering: pixelated; max-width: 100%; max-height: 172px;
+}
+.pxs-anchor-grid {
+    display: grid; grid-template-columns: repeat(3, 30px); gap: 3px;
+}
+.pxs-anchor-chip {
+    width: 30px; height: 26px; border-radius: 6px; cursor: pointer; font: inherit;
+    line-height: 1; color: var(--dsw-alias-label-primary, #e8ebf2);
+    background: var(--dsw-alias-bg-layer-1, #1c1f26);
+    border: 1px solid var(--dsw-alias-border-l1, rgba(255, 255, 255, .1));
+}
+.pxs-anchor-chip:hover { border-color: var(--dsw-alias-border-l2, rgba(255, 255, 255, .24)); }
+.pxs-anchor-chip[data-active="true"] {
+    border-color: var(--dsw-alias-brand-primary, #4b7bec);
+    background: color-mix(in srgb, var(--dsw-alias-brand-primary, #4b7bec) 18%, transparent);
+}
 .pxs-menu {
   position: fixed; z-index: 40; min-width: 132px; padding: 4px; border-radius: 8px;
   background: var(--dsw-alias-bg-overlay, #262a33); border: 1px solid var(--dsw-alias-border-l2, rgba(255,255,255,.2));
@@ -665,6 +1030,8 @@ window.__ModuleLoader__.load({
             const [renameValue, setRenameValue] = useState('');
             const [saveDialog, setSaveDialog] = useState(null);
             const [editing, setEditing] = useState(null);
+            const [importDialog, setImportDialog] = useState(null);
+            const [resizeDialog, setResizeDialog] = useState(null);
 
             const stageRef = useRef(null);
             const canvasRef = useRef(null);
@@ -695,6 +1062,7 @@ window.__ModuleLoader__.load({
             // Indirection for the save-as action: the keyboard effect is registered
             // before the callback is created, so it must not close over the binding.
             const saveAsRef = useRef(null);
+            const fileRef = useRef(null);
 
             if (gridRef.current !== showGrid) gridRef.current = showGrid;
             sizeRef.current = { left: leftWidth, right: rightWidth };
@@ -947,10 +1315,7 @@ window.__ModuleLoader__.load({
                 if (!current) return;
                 const history = historyRef.current;
                 if (options.snapshot !== false) {
-                    history.undo.push({
-                        palette: current.palette.slice(),
-                        layers: current.layers.map((layer) => ({ ...layer, rows: layer.rows.slice() })),
-                    });
+                    history.undo.push(snapshotOf(current));
                     if (history.undo.length > HISTORY_LIMIT) history.undo.shift();
                     history.redo = [];
                 }
@@ -972,6 +1337,10 @@ window.__ModuleLoader__.load({
                     palette: snapshot.palette.slice(),
                     layers: snapshot.layers.map((layer) => ({ ...layer, rows: layer.rows.slice() })),
                 };
+                if (typeof snapshot.w === 'number' && typeof snapshot.h === 'number') {
+                    next.w = snapshot.w;
+                    next.h = snapshot.h;
+                }
                 docRef.current = next;
                 setDoc(next);
                 if (!next.layers[layerRef.current]) {
@@ -988,10 +1357,7 @@ window.__ModuleLoader__.load({
                 const snapshot = history.undo.pop();
                 if (!snapshot) return;
                 const current = docRef.current;
-                history.redo.push({
-                    palette: current.palette.slice(),
-                    layers: current.layers.map((layer) => ({ ...layer, rows: layer.rows.slice() })),
-                });
+                history.redo.push(snapshotOf(current));
                 applyHistory(snapshot);
             }, [applyHistory]);
 
@@ -1000,10 +1366,7 @@ window.__ModuleLoader__.load({
                 const snapshot = history.redo.pop();
                 if (!snapshot) return;
                 const current = docRef.current;
-                history.undo.push({
-                    palette: current.palette.slice(),
-                    layers: current.layers.map((layer) => ({ ...layer, rows: layer.rows.slice() })),
-                });
+                history.undo.push(snapshotOf(current));
                 applyHistory(snapshot);
             }, [applyHistory]);
 
@@ -1107,10 +1470,7 @@ window.__ModuleLoader__.load({
 
                 // Real stroke: snapshot once, then paint continuously.
                 const history = historyRef.current;
-                history.undo.push({
-                    palette: current.palette.slice(),
-                    layers: current.layers.map((layer) => ({ ...layer, rows: layer.rows.slice() })),
-                });
+                history.undo.push(snapshotOf(current));
                 if (history.undo.length > HISTORY_LIMIT) history.undo.shift();
                 history.redo = [];
                 strokeRef.current = { pointerId: event.pointerId, last: cell };
@@ -1410,6 +1770,7 @@ window.__ModuleLoader__.load({
                     root: '',
                     dirs: [],
                     name,
+                    scale: clampExportScale(readStoredNumber('pxs:exportScale', 1), current.w, current.h),
                     loading: true,
                     busy: false,
                     error: '',
@@ -1423,15 +1784,17 @@ window.__ModuleLoader__.load({
                 if (!current || !dialog || dialog.busy) return;
                 if (typeof dialog.path !== 'string' || dialog.path === '') return;
                 const target = joinPath(dialog.path, ensurePngName(dialog.name));
+                const scale = clampExportScale(dialog.scale, current.w, current.h);
                 setSaveDialog((value) => (value ? { ...value, busy: true, error: '' } : value));
                 try {
-                    const saved = await callApi({ op: 'exportTo', doc: current, path: target });
+                    const saved = await callApi({ op: 'exportTo', doc: current, path: target, scale });
                     const next = { ...current, filePath: typeof saved.path === 'string' ? saved.path : target };
                     docRef.current = next;
                     setDoc(next);
                     setSaveDialog(null);
                     setError('');
-                    setNotice(`已保存 ${next.filePath}`);
+                    storeValue('pxs:exportScale', String(scale));
+                    setNotice(`已保存 ${next.filePath}${scale > 1 ? `（${scale}×）` : ''}`);
                     const stored = await callApi({ op: 'save', doc: next });
                     if (stored && stored.doc) {
                         docRef.current = stored.doc;
@@ -1455,8 +1818,10 @@ window.__ModuleLoader__.load({
                     return;
                 }
                 try {
-                    const saved = await callApi({ op: 'exportTo', doc: current, path: filePath });
-                    setNotice(saved.overwritten ? `已覆盖 ${saved.path}` : `已保存 ${saved.path}`);
+                    const scale = clampExportScale(readStoredNumber('pxs:exportScale', 1), current.w, current.h);
+                    const saved = await callApi({ op: 'exportTo', doc: current, path: filePath, scale });
+                    const suffix = scale > 1 ? `（${scale}×）` : '';
+                    setNotice(`${saved.overwritten ? `已覆盖 ${saved.path}` : `已保存 ${saved.path}`}${suffix}`);
                     setError('');
                 } catch (cause) {
                     const message = cause instanceof Error ? cause.message : String(cause);
@@ -1472,6 +1837,128 @@ window.__ModuleLoader__.load({
             saveAsRef.current = saveAsPng;
 
             /* -------------------------------------------------------------- */
+            /* import a picture                                               */
+            /* -------------------------------------------------------------- */
+
+            const openImportDialog = useCallback((file) => {
+                if (!file) return;
+                void (async () => {
+                    try {
+                        const sample = await readImagePixels(file);
+                        const current = docRef.current;
+                        setError('');
+                        setImportDialog(buildImportDocument({
+                            sample,
+                            name: importName(file),
+                            mode: 'auto',
+                            dither: false,
+                            sourceW: sample.sourceW,
+                            sourceH: sample.sourceH,
+                            width: sample.width,
+                            height: sample.height,
+                            busy: false,
+                        }, current ? current.palette : null));
+                    } catch (cause) {
+                        setError(cause instanceof Error ? cause.message : String(cause));
+                    }
+                })();
+            }, []);
+
+            const retuneImport = useCallback((patch) => {
+                const current = docRef.current;
+                setImportDialog((value) => (value
+                    ? buildImportDocument({ ...value, ...patch }, current ? current.palette : null)
+                    : value));
+            }, []);
+
+            const confirmImport = useCallback(() => {
+                const dialog = importDialog;
+                if (!dialog || dialog.busy || !Array.isArray(dialog.rows)) return;
+                setImportDialog((value) => (value ? { ...value, busy: true, error: '' } : value));
+                void (async () => {
+                    try {
+                        const width = dialog.width;
+                        const height = dialog.height;
+                        const name = String(dialog.name || '').trim().slice(0, 60) || `${width}×${height} 导入`;
+                        const created = await callApi({ op: 'create', name, w: width, h: height, palette: dialog.palette });
+                        // create ignores layers, so the pixel grid goes in through save.
+                        const saved = await callApi({
+                            op: 'save',
+                            doc: {
+                                ...created.doc,
+                                layers: [{ name: '图层 1', visible: true, rows: dialog.rows }],
+                            },
+                        });
+                        const next = saved && saved.doc ? saved.doc : created.doc;
+                        docRef.current = next;
+                        setDoc(next);
+                        layerRef.current = 0;
+                        setLayerIndex(0);
+                        setColorIndex(0);
+                        editSessionRef.current = null;
+                        setEditing(null);
+                        historyRef.current = { undo: [], redo: [] };
+                        setImportDialog(null);
+                        setStatus('clean');
+                        setNotice(`已导入「${name}」${width}×${height}`);
+                        await refreshDocs();
+                        window.requestAnimationFrame(() => fitToView());
+                    } catch (cause) {
+                        const message = cause instanceof Error ? cause.message : String(cause);
+                        setImportDialog((value) => (value ? { ...value, busy: false, error: message } : value));
+                    }
+                })();
+            }, [fitToView, importDialog, refreshDocs]);
+
+            /* -------------------------------------------------------------- */
+            /* canvas size / crop                                             */
+            /* -------------------------------------------------------------- */
+
+            const openResizeDialog = useCallback(() => {
+                const current = docRef.current;
+                if (!current) return;
+                setResizeDialog({ w: current.w, h: current.h, anchor: 'c', error: '' });
+            }, []);
+
+            const confirmResize = useCallback(() => {
+                const current = docRef.current;
+                const dialog = resizeDialog;
+                if (!current || !dialog) return;
+                const width = Math.round(Number(dialog.w));
+                const height = Math.round(Number(dialog.h));
+                if (!Number.isFinite(width) || !Number.isFinite(height) || width < 1 || height < 1) {
+                    setResizeDialog({ ...dialog, error: '宽高要填 1 以上的整数' });
+                    return;
+                }
+                if (width > MAX_SIDE || height > MAX_SIDE) {
+                    setResizeDialog({ ...dialog, error: `最大 ${MAX_SIDE}×${MAX_SIDE}` });
+                    return;
+                }
+                setResizeDialog(null);
+                if (width === current.w && height === current.h) {
+                    setNotice('画布尺寸没有变化');
+                    return;
+                }
+                const history = historyRef.current;
+                history.undo.push(snapshotOf(current));
+                if (history.undo.length > HISTORY_LIMIT) history.undo.shift();
+                history.redo = [];
+                const layers = current.layers.map((layer) => ({
+                    ...layer,
+                    rows: resizeRows(layer.rows, current.w, current.h, width, height, dialog.anchor),
+                }));
+                const next = { ...current, w: width, h: height, layers };
+                docRef.current = next;
+                setDoc(next);
+                scheduleSave();
+                setNotice(`画布已调整为 ${width}×${height}`);
+                window.requestAnimationFrame(() => {
+                    fitToView();
+                    requestPaint();
+                });
+            }, [fitToView, requestPaint, resizeDialog, scheduleSave]);
+
+            /* -------------------------------------------------------------- */
             /* palette actions                                                */
             /* -------------------------------------------------------------- */
 
@@ -1479,10 +1966,7 @@ window.__ModuleLoader__.load({
                 const current = docRef.current;
                 if (!current) return;
                 const history = historyRef.current;
-                history.undo.push({
-                    palette: current.palette.slice(),
-                    layers: current.layers.map((layer) => ({ ...layer, rows: layer.rows.slice() })),
-                });
+                history.undo.push(snapshotOf(current));
                 if (history.undo.length > HISTORY_LIMIT) history.undo.shift();
                 history.redo = [];
             }, []);
@@ -1691,10 +2175,7 @@ window.__ModuleLoader__.load({
                 const current = docRef.current;
                 if (!current) return null;
                 const history = historyRef.current;
-                history.undo.push({
-                    palette: current.palette.slice(),
-                    layers: current.layers.map((layer) => ({ ...layer, rows: layer.rows.slice() })),
-                });
+                history.undo.push(snapshotOf(current));
                 if (history.undo.length > HISTORY_LIMIT) history.undo.shift();
                 history.redo = [];
                 return current;
@@ -1949,6 +2430,31 @@ window.__ModuleLoader__.load({
                     onClick: openNewDialog,
                     title: '新建作品（可选名字与尺寸）',
                 }, '新建'),
+                h('button', {
+                    className: 'pxs-btn',
+                    onClick: () => {
+                        if (fileRef.current) fileRef.current.click();
+                    },
+                    title: '打开图片，转成像素画导入新作品',
+                }, '打开图片'),
+                h('input', {
+                    ref: fileRef,
+                    type: 'file',
+                    accept: 'image/png,image/jpeg,image/gif,image/webp,image/bmp',
+                    style: { display: 'none' },
+                    onChange: (event) => {
+                        const input = event.target;
+                        const picked = input.files && input.files[0];
+                        input.value = '';
+                        if (picked) openImportDialog(picked);
+                    },
+                }),
+                h('button', {
+                    className: 'pxs-btn',
+                    disabled: !doc,
+                    onClick: openResizeDialog,
+                    title: '调整画布尺寸 / 裁剪（可撤销）',
+                }, '尺寸'),
                 h('span', { className: 'pxs-spacer' }),
                 h('button', {
                     className: 'pxs-btn pxs-btn-icon',
@@ -2396,6 +2902,25 @@ window.__ModuleLoader__.load({
                             }
                         },
                     })),
+                h('div', { className: 'pxs-dialog-row', style: { flexWrap: 'wrap' } },
+                    h('span', { className: 'pxs-dialog-label' }, '倍率'),
+                    EXPORT_SCALES.map((value) => {
+                        const ceiling = maxScaleFor(doc ? doc.w : 1, doc ? doc.h : 1);
+                        const allowed = value <= ceiling;
+                        return h('button', {
+                            key: value,
+                            className: 'pxs-scale-chip',
+                            'data-active': Number(saveDialog.scale) === value ? 'true' : 'false',
+                            disabled: !allowed,
+                            title: allowed
+                                ? `${value}× → ${(doc ? doc.w : 0) * value}×${(doc ? doc.h : 0) * value}`
+                                : '超出单张 PNG 上限',
+                            onClick: () => setSaveDialog((current) => (current ? { ...current, scale: value } : current)),
+                        }, `${value}×`);
+                    }),
+                    h('span', { className: 'pxs-hint' }, doc
+                        ? `${saveDialog.scale}× = ${doc.w * saveDialog.scale}×${doc.h * saveDialog.scale}`
+                        : '')),
                 saveDialog.error ? h('div', { className: 'pxs-dialog-error' }, saveDialog.error) : null,
                 h('div', { className: 'pxs-dialog-actions' },
                     h('button', { className: 'pxs-btn', onClick: () => setSaveDialog(null) }, '取消'),
@@ -2490,6 +3015,139 @@ window.__ModuleLoader__.load({
                         onClick: confirmNewDoc,
                     }, creating ? '创建中…' : '创建')))) : null;
 
+            const importDialogNode = importDialog ? h('div', {
+                className: 'pxs-modal',
+                onPointerDown: (event) => {
+                    if (event.target === event.currentTarget && !importDialog.busy) setImportDialog(null);
+                },
+            },
+            h('div', { className: 'pxs-dialog pxs-import-dialog', role: 'dialog', 'aria-label': '打开图片' },
+                h('div', { className: 'pxs-dialog-head' },
+                    h('strong', null, '打开图片'),
+                    h('button', {
+                        className: 'pxs-dialog-close',
+                        disabled: importDialog.busy,
+                        onClick: () => setImportDialog(null),
+                    }, '×')),
+                h('div', { className: 'pxs-dialog-row' },
+                    h('span', { className: 'pxs-dialog-label' }, '名字'),
+                    h('input', {
+                        className: 'pxs-input',
+                        style: { flex: 1 },
+                        maxLength: 60,
+                        value: importDialog.name,
+                        onChange: (event) => {
+                            const value = event.target.value;
+                            setImportDialog((current) => (current ? { ...current, name: value } : current));
+                        },
+                    })),
+                h('div', { className: 'pxs-dialog-row' },
+                    h('span', { className: 'pxs-dialog-label' }, '原图'),
+                    h('span', { className: 'pxs-hint' },
+                        `${importDialog.sourceW}×${importDialog.sourceH} → ${importDialog.width}×${importDialog.height}`
+                        + ` · ${importDialog.palette.length} 色`
+                        + (importDialog.note ? ` · ${importDialog.note}` : ''))),
+                h('div', { className: 'pxs-dialog-row', style: { flexWrap: 'wrap' } },
+                    h('span', { className: 'pxs-dialog-label' }, '配色'),
+                    [
+                        { id: 'auto', label: '自动提取' },
+                        { id: 'current', label: '当前调色板', disabled: !(doc && doc.palette.length > 0) },
+                        { id: 'pico8', label: 'PICO-8' },
+                    ].map((mode) => h('button', {
+                        key: mode.id,
+                        className: 'pxs-scale-chip',
+                        'data-active': importDialog.mode === mode.id ? 'true' : 'false',
+                        disabled: mode.disabled === true || importDialog.busy,
+                        onClick: () => retuneImport({ mode: mode.id }),
+                    }, mode.label)),
+                    h('button', {
+                        className: 'pxs-scale-chip',
+                        'data-active': importDialog.dither ? 'true' : 'false',
+                        disabled: importDialog.busy,
+                        title: '误差扩散抖动，渐变更自然但像素更碎',
+                        onClick: () => retuneImport({ dither: !importDialog.dither }),
+                    }, '抖动')),
+                importDialog.preview
+                    ? h('div', { className: 'pxs-import-preview' },
+                        h('img', { src: importDialog.preview, alt: '导入预览' }))
+                    : null,
+                importDialog.error ? h('div', { className: 'pxs-dialog-error' }, importDialog.error) : null,
+                h('div', { className: 'pxs-dialog-actions' },
+                    h('button', {
+                        className: 'pxs-btn',
+                        disabled: importDialog.busy,
+                        onClick: () => setImportDialog(null),
+                    }, '取消'),
+                    h('button', {
+                        className: 'pxs-btn pxs-btn-primary',
+                        disabled: importDialog.busy || !Array.isArray(importDialog.rows),
+                        onClick: confirmImport,
+                    }, importDialog.busy ? '导入中…' : '导入')))) : null;
+
+            const resizeDialogNode = resizeDialog ? h('div', {
+                className: 'pxs-modal',
+                onPointerDown: (event) => {
+                    if (event.target === event.currentTarget) setResizeDialog(null);
+                },
+            },
+            h('div', { className: 'pxs-dialog pxs-resize-dialog', role: 'dialog', 'aria-label': '画布尺寸' },
+                h('div', { className: 'pxs-dialog-head' },
+                    h('strong', null, '画布尺寸 / 裁剪'),
+                    h('button', {
+                        className: 'pxs-dialog-close',
+                        onClick: () => setResizeDialog(null),
+                    }, '×')),
+                h('div', { className: 'pxs-dialog-row' },
+                    h('span', { className: 'pxs-dialog-label' }, '当前'),
+                    h('span', { className: 'pxs-hint' },
+                        doc ? `${doc.w}×${doc.h} · 目标 ${Math.round(Number(resizeDialog.w) || 0)}×${Math.round(Number(resizeDialog.h) || 0)}` : '')),
+                h('div', { className: 'pxs-dialog-row' },
+                    h('span', { className: 'pxs-dialog-label' }, '宽'),
+                    h('input', {
+                        className: 'pxs-input',
+                        style: { width: 84 },
+                        type: 'number',
+                        min: 1,
+                        max: MAX_SIDE,
+                        value: resizeDialog.w,
+                        onChange: (event) => {
+                            const value = event.target.value;
+                            setResizeDialog((current) => (current ? { ...current, w: value } : current));
+                        },
+                    }),
+                    h('span', { className: 'pxs-dialog-label' }, '高'),
+                    h('input', {
+                        className: 'pxs-input',
+                        style: { width: 84 },
+                        type: 'number',
+                        min: 1,
+                        max: MAX_SIDE,
+                        value: resizeDialog.h,
+                        onChange: (event) => {
+                            const value = event.target.value;
+                            setResizeDialog((current) => (current ? { ...current, h: value } : current));
+                        },
+                    }),
+                    h('span', { className: 'pxs-hint' }, `最大 ${MAX_SIDE}`)),
+                h('div', { className: 'pxs-dialog-row' },
+                    h('span', { className: 'pxs-dialog-label' }, '锚点'),
+                    h('div', { className: 'pxs-anchor-grid' },
+                        ANCHORS.map((anchor) => h('button', {
+                            key: anchor.id,
+                            className: 'pxs-anchor-chip',
+                            'data-active': resizeDialog.anchor === anchor.id ? 'true' : 'false',
+                            title: `以${anchor.label}为基准保留画面`,
+                            onClick: () => setResizeDialog((current) => (current ? { ...current, anchor: anchor.id } : current)),
+                        }, anchor.label))),
+                    h('span', { className: 'pxs-hint' }, '扩边补透明，裁掉的部分丢弃')),
+                resizeDialog.error ? h('div', { className: 'pxs-dialog-error' }, resizeDialog.error) : null,
+                h('div', { className: 'pxs-dialog-actions' },
+                    h('button', { className: 'pxs-btn', onClick: () => setResizeDialog(null) }, '取消'),
+                    h('button', {
+                        className: 'pxs-btn pxs-btn-primary',
+                        onClick: confirmResize,
+                    }, '应用')))) : null;
+
             return h('div', { className: 'pxs-root' },
                 h('style', null, CSS),
                 barNode,
@@ -2517,7 +3175,9 @@ window.__ModuleLoader__.load({
                 rightPanel),
                 menuNode,
                 dialogNode,
-                newDialogNode);
+                newDialogNode,
+                importDialogNode,
+                resizeDialogNode);
         }
 
         /**
