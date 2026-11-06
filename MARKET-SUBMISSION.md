@@ -7,7 +7,7 @@
 | 通道 | 状态 | 卡在哪 |
 |---|---|---|
 | npm | ✅ 已上线 `0.1.1`（latest） | — |
-| 社区目录（6000+，`dshm_search` 来源之一） | ⏳ 物料已备好 | 还没提 `awesome-dsh-plugin` 的 PR（第 2 节，文件已写好） |
+| 社区目录（6000+，`dshm_search` 来源之一） | 🟡 PR 已提交 [#12712](https://github.com/awesome-dsh-plugin/awesome-dsh-plugin/pull/12712) | CI 在跑；「仓库满 1 天」那条北京时间 2026-11-07 21:20 自动转绿，之后等合并 |
 | 精选清单（33 条手工收录） | ❌ 未收录 | 还没给 `iasiv5/dsh-m` 提 `registry.json` PR |
 
 已核实的四条事实：
@@ -51,6 +51,8 @@ canvas
 ## 2. 社区目录（awesome-dsh-plugin.com）—— **更正：不是自动抓的**
 
 早先以为「加了 `dsh-plugin` topic 就会被自动收录」，**不对**。topic 只是**投稿的准入条件之一**，目录本身靠 PR 一条一条加。真正的数据源是仓库 `awesome-dsh-plugin/awesome-dsh-plugin` 的 `data/plugins/`：一个插件一个 YAML 文件，两个 README 由脚本生成（`contributing.md` 明令禁止手改 README）。
+
+> **已提交：** PR [#12712](https://github.com/awesome-dsh-plugin/awesome-dsh-plugin/pull/12712)（`Muxiuesd:main` → `main`，1 个文件 +7 行；fork 提交 `cf1695a`）。首个 CI 里 awesome-lint、README 与 `data/plugins` 一致性等 14 个步骤已通过，只剩下「仓库年龄」这条时间闸门。
 
 ### 投稿流程
 
