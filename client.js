@@ -83,6 +83,7 @@ window.__ModuleLoader__.load({
             { id: 'eraser', label: '橡皮', key: 'E', icon: 'eraser' },
             { id: 'bucket', label: '油漆桶', key: 'G', icon: 'bucket' },
             { id: 'picker', label: '吸管', key: 'I', icon: 'picker' },
+            { id: 'select', label: '选区', key: 'M', icon: 'select' },
         ];
 
         /* ------------------------------------------------------------------ */
@@ -403,6 +404,114 @@ window.__ModuleLoader__.load({
         }
 
         /* ------------------------------------------------------------------ */
+        /* selection                                                          */
+        /* ------------------------------------------------------------------ */
+
+        const MIN_SELECTION = 1;
+
+        /** Normalised rectangle spanning two grid cells (both inclusive). */
+        function selectionBetween(a, b) {
+            return {
+                x: Math.min(a.x, b.x),
+                y: Math.min(a.y, b.y),
+                w: Math.abs(a.x - b.x) + 1,
+                h: Math.abs(a.y - b.y) + 1,
+            };
+        }
+
+        /** Keeps a rectangle inside the canvas, shrinking it at the far edges. */
+        function clampRectangle(rect, width, height) {
+            const x = clamp(Math.round(rect.x), 0, Math.max(0, width - MIN_SELECTION));
+            const y = clamp(Math.round(rect.y), 0, Math.max(0, height - MIN_SELECTION));
+            const w = clamp(Math.round(rect.w), MIN_SELECTION, Math.max(MIN_SELECTION, width - x));
+            const h = clamp(Math.round(rect.h), MIN_SELECTION, Math.max(MIN_SELECTION, height - y));
+            return { x, y, w, h };
+        }
+
+        /** Slides a rectangle to (x, y) without changing its size or leaving the canvas. */
+        function moveRectangle(rect, x, y, width, height) {
+            return {
+                x: clamp(Math.round(x), 0, Math.max(0, width - rect.w)),
+                y: clamp(Math.round(y), 0, Math.max(0, height - rect.h)),
+                w: rect.w,
+                h: rect.h,
+            };
+        }
+
+        function pointInRectangle(rect, cell) {
+            return cell.x >= rect.x && cell.x < rect.x + rect.w && cell.y >= rect.y && cell.y < rect.y + rect.h;
+        }
+
+        /** Copies the selected characters out of one layer, padding short rows. */
+        function readRegion(rows, rect) {
+            const region = [];
+            for (let y = 0; y < rect.h; y += 1) {
+                const line = rows[rect.y + y] || '';
+                region.push(line.slice(rect.x, rect.x + rect.w).padEnd(rect.w, '.'));
+            }
+            return region;
+        }
+
+        /** Writes characters back into one layer, leaving every other cell untouched. */
+        function writeRegion(rows, region, x, y) {
+            const next = rows.slice();
+            for (let row = 0; row < region.length; row += 1) {
+                const target = y + row;
+                if (target < 0 || target >= next.length) continue;
+                const chars = (next[target] || '').split('');
+                for (let column = 0; column < region[row].length; column += 1) {
+                    const at = x + column;
+                    if (at >= 0 && at < chars.length) chars[at] = region[row][column] || '.';
+                }
+                next[target] = chars.join('');
+            }
+            return next;
+        }
+
+        function blankRegion(rect) {
+            const region = [];
+            for (let y = 0; y < rect.h; y += 1) region.push('.'.repeat(rect.w));
+            return region;
+        }
+
+        function fillRows(rows, rect, ch) {
+            const region = [];
+            for (let y = 0; y < rect.h; y += 1) region.push(ch.repeat(rect.w));
+            return writeRegion(rows, region, rect.x, rect.y);
+        }
+
+        function emptyRows(rows, rect) {
+            return writeRegion(rows, blankRegion(rect), rect.x, rect.y);
+        }
+
+        /** Mirrors the selected characters inside the box. */
+        function mirrorRows(rows, rect, horizontal) {
+            const region = readRegion(rows, rect);
+            const flipped = horizontal
+                ? region.map((line) => line.split('').reverse().join(''))
+                : region.slice().reverse();
+            return writeRegion(rows, flipped, rect.x, rect.y);
+        }
+
+        /** Top-most visible character in every cell of the rectangle, for the move preview. */
+        function mergedRegion(layers, rect) {
+            const region = blankRegion(rect);
+            layers.forEach((layer) => {
+                if (layer.visible === false) return;
+                for (let y = 0; y < rect.h; y += 1) {
+                    const line = layer.rows[rect.y + y] || '';
+                    const chars = region[y].split('');
+                    for (let x = 0; x < rect.w; x += 1) {
+                        const ch = line[rect.x + x];
+                        if (ch && ch !== '.') chars[x] = ch;
+                    }
+                    region[y] = chars.join('');
+                }
+            });
+            return region;
+        }
+
+        /* ------------------------------------------------------------------ */
         /* image import                                                       */
         /* ------------------------------------------------------------------ */
 
@@ -703,6 +812,14 @@ window.__ModuleLoader__.load({
                     }),
                     h('path', { d: 'M13.2 10.4c1 1.2 1.5 2 1.5 2.6a1.5 1.5 0 0 1-3 0c0-.6.5-1.4 1.5-2.6z', fill: 'currentColor' }));
             }
+            if (name === 'select') {
+                return h('svg', common,
+                    h('rect', {
+                        x: 2.5, y: 2.5, width: 11, height: 11, rx: 1,
+                        fill: 'none', stroke: 'currentColor', strokeWidth: 1.4, strokeDasharray: '3 2',
+                    }),
+                    h('path', { d: 'M8 1.2v2.2M8 12.6v2.2M1.2 8h2.2M12.6 8h2.2', fill: 'none', stroke: 'currentColor', strokeWidth: 1.4, strokeLinecap: 'round' }));
+            }
             return h('svg', common,
                 h('path', {
                     d: 'M9.9 2.6a3.4 3.4 0 1 0 3.5 3.4c0-.6-.2-1.2-.5-1.7l1.6-1.6-1.1-1.1-1.6 1.6a3.4 3.4 0 0 0-1.9-.6z',
@@ -867,6 +984,24 @@ window.__ModuleLoader__.load({
 .pxs-status { font-size: 11px; color: var(--dsw-alias-label-secondary, #9aa1ad); min-width: 54px; text-align: right; }
 .pxs-status[data-state="dirty"] { color: var(--dsw-alias-state-warn-primary, #e0a33a); }
 .pxs-status[data-state="error"] { color: var(--dsw-alias-state-error-primary, #e0574f); }
+.pxs-select-status {
+  min-width: 0; text-align: left; font-variant-numeric: tabular-nums;
+  color: var(--dsw-alias-brand-primary, #7aa2f7);
+}
+.pxs-selection-bar {
+  position: absolute; left: 10px; right: 10px; bottom: 10px; z-index: 3;
+  display: flex; flex-wrap: wrap; align-items: center; gap: 6px;
+  padding: 6px 8px; border-radius: 9px;
+  background: var(--dsw-alias-bg-overlay, rgba(38, 42, 51, .9));
+  border: 1px solid var(--dsw-alias-border-l2, rgba(255, 255, 255, .2));
+  box-shadow: 0 6px 20px rgba(0, 0, 0, .28);
+  backdrop-filter: blur(6px);
+}
+.pxs-selection-bar .pxs-btn { height: 24px; padding: 0 8px; font-size: 11px; }
+.pxs-selection-label {
+  font-size: 11px; margin-right: auto; color: var(--dsw-alias-label-secondary, #9aa1ad);
+  font-variant-numeric: tabular-nums; white-space: nowrap;
+}
 .pxs-notice {
     font-size: 11px;
     color: var(--dsw-alias-state-success-primary, #3fa45b);
@@ -1032,6 +1167,9 @@ window.__ModuleLoader__.load({
             const [editing, setEditing] = useState(null);
             const [importDialog, setImportDialog] = useState(null);
             const [resizeDialog, setResizeDialog] = useState(null);
+            const [selection, setSelection] = useState(null);
+            const [grabMode, setGrabMode] = useState(false);
+            const [allLayersMode, setAllLayersMode] = useState(false);
 
             const stageRef = useRef(null);
             const canvasRef = useRef(null);
@@ -1063,10 +1201,21 @@ window.__ModuleLoader__.load({
             // before the callback is created, so it must not close over the binding.
             const saveAsRef = useRef(null);
             const fileRef = useRef(null);
+            /** Live rectangle, read by the pointer handlers and the paint loop. */
+            const selectionRef = useRef(null);
+            /** In-flight selection drag: { mode, pointerId, start, origin }. */
+            const selectDragRef = useRef(null);
+            /** Indirection for the keyboard effect, which is registered before these callbacks exist. */
+            const selectApiRef = useRef({});
+            const grabRef = useRef(false);
+            const allLayersRef = useRef(false);
 
             if (gridRef.current !== showGrid) gridRef.current = showGrid;
             sizeRef.current = { left: leftWidth, right: rightWidth };
             if (editingRef.current !== editing) editingRef.current = editing;
+            if (grabRef.current !== grabMode) grabRef.current = grabMode;
+            if (allLayersRef.current !== allLayersMode) allLayersRef.current = allLayersMode;
+            selectionRef.current = selection;
 
             docRef.current = doc;
             toolRef.current = tool;
@@ -1200,10 +1349,47 @@ window.__ModuleLoader__.load({
                     context.restore();
                 }
 
+                if (selection) {
+                    const boxX = Math.round(pan.x + selection.x * scale);
+                    const boxY = Math.round(pan.y + selection.y * scale);
+                    const boxW = Math.max(1, Math.round(selection.w * scale));
+                    const boxH = Math.max(1, Math.round(selection.h * scale));
+                    const floating = selection.float;
+                    if (floating && floating.region) {
+                        // Floating content preview, drawn over the cells it was lifted from.
+                        for (let row = 0; row < floating.region.length; row += 1) {
+                            const line = floating.region[row];
+                            for (let column = 0; column < line.length; column += 1) {
+                                const ch = line[column];
+                                if (!ch || ch === '.') continue;
+                                const color = current.palette[indexFor(ch)];
+                                if (!color) continue;
+                                context.fillStyle = color;
+                                context.fillRect(
+                                    Math.round(pan.x + (selection.x + column) * scale),
+                                    Math.round(pan.y + (selection.y + row) * scale),
+                                    Math.ceil(scale),
+                                    Math.ceil(scale),
+                                );
+                            }
+                        }
+                    }
+                    // Marching ants: one dark and one offset light dashed border.
+                    context.save();
+                    context.lineWidth = 1;
+                    context.setLineDash([4, 4]);
+                    context.strokeStyle = 'rgba(0,0,0,0.8)';
+                    context.strokeRect(boxX + 0.5, boxY + 0.5, boxW - 1, boxH - 1);
+                    context.lineDashOffset = 4;
+                    context.strokeStyle = 'rgba(255,255,255,0.95)';
+                    context.strokeRect(boxX + 0.5, boxY + 0.5, boxW - 1, boxH - 1);
+                    context.restore();
+                }
+
                 context.strokeStyle = 'rgba(255,255,255,0.22)';
                 context.lineWidth = 1;
                 context.strokeRect(Math.round(pan.x) + 0.5, Math.round(pan.y) + 0.5, Math.round(docWidth), Math.round(docHeight));
-            }, [composeImage]);
+            }, [composeImage, selection]);
 
             const requestPaint = useCallback(() => {
                 if (frameRef.current !== 0) return;
@@ -1430,6 +1616,170 @@ window.__ModuleLoader__.load({
                 }
             }, []);
 
+            const pushHistory = useCallback(() => {
+                const current = docRef.current;
+                if (!current) return;
+                const history = historyRef.current;
+                history.undo.push(snapshotOf(current));
+                if (history.undo.length > HISTORY_LIMIT) history.undo.shift();
+                history.redo = [];
+            }, []);
+
+            const selectionTargets = useCallback((allLayers) => {
+                const current = docRef.current;
+                if (!current) return [];
+                if (allLayers) {
+                    return current.layers
+                        .map((layer, index) => ({ layer, index }))
+                        .filter((entry) => entry.layer && entry.layer.visible !== false);
+                }
+                const layer = current.layers[layerRef.current];
+                return layer ? [{ layer, index: layerRef.current }] : [];
+            }, []);
+
+            const setSelectionRect = useCallback((rect) => {
+                selectionRef.current = rect;
+                setSelection(rect);
+            }, []);
+
+            const selectAll = useCallback(() => {
+                const current = docRef.current;
+                if (!current) return;
+                setTool('select');
+                setSelectionRect({ x: 0, y: 0, w: current.w, h: current.h, float: null });
+                setStatus('select');
+                requestPaint();
+            }, [requestPaint, setSelectionRect]);
+
+            const putBackLifted = useCallback((current, active) => {
+                const float = active.float;
+                if (!float) return current;
+                const layers = current.layers.map((layer, index) => {
+                    const item = float.targets.find((entry) => entry.index === index);
+                    if (!item) return layer;
+                    return {
+                        ...layer,
+                        rows: writeRegion(layer.rows, item.region, float.origin.x, float.origin.y),
+                    };
+                });
+                return { ...current, layers };
+            }, []);
+
+            const cancelSelection = useCallback(() => {
+                const current = docRef.current;
+                const active = selectionRef.current;
+                selectionRef.current = null;
+                setSelection(null);
+                if (current && active && active.float) {
+                    const next = putBackLifted(current, active);
+                    docRef.current = next;
+                    setDoc(next);
+                    scheduleSave();
+                }
+                requestPaint();
+            }, [putBackLifted, requestPaint, scheduleSave]);
+
+            /** Lifts the selected pixels out of their layers; false when nothing could be lifted. */
+            const liftSelection = useCallback((allLayers) => {
+                const current = docRef.current;
+                const active = selectionRef.current;
+                if (!current || !active || active.float) return false;
+                const rect = clampRectangle(active, current.w, current.h);
+                const targets = selectionTargets(allLayers);
+                if (targets.length === 0) return false;
+                pushHistory();
+                const items = targets.map((entry) => ({ index: entry.index, region: readRegion(entry.layer.rows, rect) }));
+                const layers = current.layers.map((layer, index) => {
+                    const item = items.find((entry) => entry.index === index);
+                    return item ? { ...layer, rows: emptyRows(layer.rows, rect) } : layer;
+                });
+                const next = { ...current, layers };
+                docRef.current = next;
+                setDoc(next);
+                setSelectionRect({
+                    ...rect,
+                    float: {
+                        region: mergedRegion(current.layers, rect),
+                        origin: { x: rect.x, y: rect.y },
+                        targets: items,
+                    },
+                });
+                setStatus('dirty');
+                return true;
+            }, [pushHistory, selectionTargets, setSelectionRect]);
+
+            /** Drops the lifted pixels at the rectangle's current position. */
+            const dropSelection = useCallback(() => {
+                const current = docRef.current;
+                const active = selectionRef.current;
+                if (!current || !active || !active.float) return;
+                const rect = clampRectangle(active, current.w, current.h);
+                const float = active.float;
+                const layers = current.layers.map((layer, index) => {
+                    const item = float.targets.find((entry) => entry.index === index);
+                    return item ? { ...layer, rows: writeRegion(layer.rows, item.region, rect.x, rect.y) } : layer;
+                });
+                const next = { ...current, layers };
+                docRef.current = next;
+                setDoc(next);
+                setSelectionRect({ ...rect, float: null });
+                setStatus('dirty');
+                scheduleSave();
+            }, [scheduleSave, setSelectionRect]);
+
+            const applySelectionEdit = useCallback((mode, allLayers) => {
+                const current = docRef.current;
+                const active = selectionRef.current;
+                if (!current || !active) return;
+                if (active.float) {
+                    const restored = putBackLifted(current, active);
+                    docRef.current = restored;
+                    setDoc(restored);
+                }
+                const base = docRef.current;
+                const rect = clampRectangle(active, base.w, base.h);
+                const targets = selectionTargets(allLayers);
+                if (targets.length === 0) return;
+                pushHistory();
+                const layers = base.layers.map((layer, index) => {
+                    const target = targets.find((entry) => entry.index === index);
+                    if (!target) return layer;
+                    let rows = layer.rows;
+                    if (mode === 'mirror-h') rows = mirrorRows(rows, rect, true);
+                    else if (mode === 'mirror-v') rows = mirrorRows(rows, rect, false);
+                    else if (mode === 'fill') rows = fillRows(rows, rect, charFor(colorRef.current));
+                    else if (mode === 'delete') rows = emptyRows(rows, rect);
+                    return { ...layer, rows };
+                });
+                const next = { ...base, layers };
+                docRef.current = next;
+                setDoc(next);
+                setSelectionRect({ ...rect, float: null });
+                setStatus('dirty');
+                scheduleSave();
+            }, [putBackLifted, pushHistory, scheduleSave, selectionTargets, setSelectionRect]);
+
+            /** Arrow-key nudging: 1 cell, 10 with Shift; carries lifted pixels along. */
+            const nudgeSelection = useCallback((dx, dy) => {
+                const current = docRef.current;
+                const active = selectionRef.current;
+                if (!current || !active) return;
+                const rect = moveRectangle(active, active.x + dx, active.y + dy, current.w, current.h);
+                setSelectionRect({ ...rect, float: active.float });
+                setStatus('select');
+            }, [setSelectionRect]);
+
+            // Exposed to the keyboard effect, which is registered before these callbacks exist.
+            selectApiRef.current = {
+                selectAll,
+                cancel: cancelSelection,
+                apply: applySelectionEdit,
+                nudge: nudgeSelection,
+                drop: dropSelection,
+                lift: liftSelection,
+                allLayers: allLayersRef.current,
+            };
+
             const onPointerDown = useCallback((event) => {
                 if (!docRef.current) return;
                 const wantsPan = event.button === 1 || spaceRef.current || event.altKey;
@@ -1449,6 +1799,47 @@ window.__ModuleLoader__.load({
                 const cell = cellFromEvent(event);
                 if (!cell) return;
                 const current = docRef.current;
+
+                if (toolRef.current === 'select') {
+                    event.preventDefault();
+                    const anchor = {
+                        x: clamp(cell.x, 0, Math.max(0, current.w - 1)),
+                        y: clamp(cell.y, 0, Math.max(0, current.h - 1)),
+                    };
+                    const active = selectionRef.current;
+                    const inside = active ? pointInRectangle(active, cell) : false;
+                    const carry = event.shiftKey || grabRef.current;
+                    event.currentTarget.setPointerCapture(event.pointerId);
+                    if (inside && carry && (active.float || liftSelection(event.altKey))) {
+                        selectDragRef.current = {
+                            mode: 'grab',
+                            pointerId: event.pointerId,
+                            start: anchor,
+                            origin: { x: active.x, y: active.y },
+                        };
+                    } else if (inside) {
+                        // Plain drag slides the frame; the pixels stay where they are.
+                        selectDragRef.current = {
+                            mode: 'move',
+                            pointerId: event.pointerId,
+                            start: anchor,
+                            origin: { x: active.x, y: active.y },
+                        };
+                    } else {
+                        setSelectionRect({
+                            ...clampRectangle({ x: anchor.x, y: anchor.y, w: 1, h: 1 }, current.w, current.h),
+                            float: null,
+                        });
+                        selectDragRef.current = {
+                            mode: 'create',
+                            pointerId: event.pointerId,
+                            start: anchor,
+                        };
+                    }
+                    setStatus('select');
+                    requestPaint();
+                    return;
+                }
 
                 if (toolRef.current === 'picker') {
                     pickColorAt(cell);
@@ -1488,6 +1879,35 @@ window.__ModuleLoader__.load({
                     requestPaint();
                     return;
                 }
+                const selectDrag = selectDragRef.current;
+                if (selectDrag && selectDrag.pointerId === event.pointerId) {
+                    const current = docRef.current;
+                    const cell = cellFromEvent(event);
+                    if (!current || !cell) return;
+                    const anchor = {
+                        x: clamp(cell.x, 0, Math.max(0, current.w - 1)),
+                        y: clamp(cell.y, 0, Math.max(0, current.h - 1)),
+                    };
+                    if (selectDrag.mode === 'create') {
+                        setSelectionRect({
+                            ...clampRectangle(selectionBetween(selectDrag.start, anchor), current.w, current.h),
+                            float: null,
+                        });
+                    } else {
+                        const active = selectionRef.current;
+                        if (!active) return;
+                        const rect = moveRectangle(
+                            { x: 0, y: 0, w: active.w, h: active.h },
+                            selectDrag.origin.x + (anchor.x - selectDrag.start.x),
+                            selectDrag.origin.y + (anchor.y - selectDrag.start.y),
+                            current.w,
+                            current.h,
+                        );
+                        setSelectionRect({ ...rect, float: active.float });
+                    }
+                    requestPaint();
+                    return;
+                }
                 const stroke = strokeRef.current;
                 if (!stroke || stroke.pointerId !== event.pointerId) return;
                 const cell = cellFromEvent(event);
@@ -1498,6 +1918,18 @@ window.__ModuleLoader__.load({
             }, [cellFromEvent, requestPaint, strokeAt]);
 
             const onPointerUp = useCallback((event) => {
+                const selectDrag = selectDragRef.current;
+                if (selectDrag && selectDrag.pointerId === event.pointerId) {
+                    selectDragRef.current = null;
+                    if (selectDrag.mode === 'grab') dropSelection();
+                    const active = selectionRef.current;
+                    if (active && (active.w < 1 || active.h < 1)) {
+                        selectionRef.current = null;
+                        setSelection(null);
+                    }
+                    requestPaint();
+                    return;
+                }
                 if (panDrawRef.current && panDrawRef.current.pointerId === event.pointerId) {
                     panDrawRef.current = null;
                     requestPaint();
@@ -1570,6 +2002,11 @@ window.__ModuleLoader__.load({
                         return;
                     }
                     const meta = event.metaKey || event.ctrlKey;
+                    if (meta && event.key.toLowerCase() === 'a') {
+                        event.preventDefault();
+                        selectApiRef.current.selectAll();
+                        return;
+                    }
                     if (meta && event.key.toLowerCase() === 'z') {
                         event.preventDefault();
                         if (event.shiftKey) redo();
@@ -1593,10 +2030,45 @@ window.__ModuleLoader__.load({
                     }
                     if (meta) return;
                     const key = event.key.toLowerCase();
+                    if (key === 'escape') {
+                        selectApiRef.current.cancel();
+                        return;
+                    }
+                    if (selectionRef.current) {
+                        if (key === 'delete' || key === 'backspace') {
+                            event.preventDefault();
+                            selectApiRef.current.apply('delete', selectApiRef.current.allLayers);
+                            return;
+                        }
+                        if (key.indexOf('arrow') === 0) {
+                            event.preventDefault();
+                            const step = event.shiftKey ? 10 : 1;
+                            const dx = key === 'arrowleft' ? -step : key === 'arrowright' ? step : 0;
+                            const dy = key === 'arrowup' ? -step : key === 'arrowdown' ? step : 0;
+                            selectApiRef.current.nudge(dx, dy);
+                            return;
+                        }
+                        if (event.shiftKey && key === 'h') {
+                            event.preventDefault();
+                            selectApiRef.current.apply('mirror-h', selectApiRef.current.allLayers);
+                            return;
+                        }
+                        if (event.shiftKey && key === 'v') {
+                            event.preventDefault();
+                            selectApiRef.current.apply('mirror-v', selectApiRef.current.allLayers);
+                            return;
+                        }
+                        if (event.shiftKey && key === 'f') {
+                            event.preventDefault();
+                            selectApiRef.current.apply('fill', selectApiRef.current.allLayers);
+                            return;
+                        }
+                    }
                     if (key === 'b') setTool('pencil');
                     else if (key === 'e') setTool('eraser');
                     else if (key === 'g') setTool('bucket');
                     else if (key === 'i') setTool('picker');
+                    else if (key === 'm') setTool('select');
                     else if (key === 'f') fitToView();
                     else if (key === 'h') {
                         const next = !gridRef.current;
@@ -1961,15 +2433,6 @@ window.__ModuleLoader__.load({
             /* -------------------------------------------------------------- */
             /* palette actions                                                */
             /* -------------------------------------------------------------- */
-
-            const pushHistory = useCallback(() => {
-                const current = docRef.current;
-                if (!current) return;
-                const history = historyRef.current;
-                history.undo.push(snapshotOf(current));
-                if (history.undo.length > HISTORY_LIMIT) history.undo.shift();
-                history.redo = [];
-            }, []);
 
             const updatePalette = useCallback((palette, options = {}) => {
                 const current = docRef.current;
@@ -2377,6 +2840,10 @@ window.__ModuleLoader__.load({
                     : status === 'error' ? '保存失败'
                         : '已保存';
 
+            const selectionText = selection
+                ? `选区 ${selection.w}×${selection.h} @ (${selection.x},${selection.y})${selection.float ? ' · 浮动' : ''}${allLayersMode ? ' · 全部图层' : ''}`
+                : '';
+
             const currentLayer = doc ? doc.layers[layerIndex] : null;
 
             const swatchNodes = doc ? doc.palette.map((color, index) => h('button', {
@@ -2525,6 +2992,7 @@ window.__ModuleLoader__.load({
                     title: '删除当前作品',
                 }, '删除'),
                 h('span', { className: 'pxs-status', 'data-state': status }, statusText),
+                selection ? h('span', { className: 'pxs-status pxs-select-status', title: '选区：拖动移框，Shift+拖动带内容，方向键微调，Esc 取消' }, selectionText) : null,
                 notice ? h('span', { className: 'pxs-notice', title: notice }, notice) : null);
 
             const errorNode = error ? h('div', { className: 'pxs-error' },
@@ -2666,7 +3134,10 @@ window.__ModuleLoader__.load({
                     h('div', null, h('kbd', null, 'G'), '填充  ', h('kbd', null, 'I'), '吸管'),
                     h('div', null, h('kbd', null, '滚轮'), '缩放  ', h('kbd', null, '空格'), '+ 拖动'),
                     h('div', null, h('kbd', null, 'F'), '适应窗口  ', h('kbd', null, '[ ]'), '笔刷'),
-                    h('div', null, h('kbd', null, 'H'), '格线开/关  ', h('kbd', null, 'Ctrl+S'), '保存')));
+                    h('div', null, h('kbd', null, 'H'), '格线开/关  ', h('kbd', null, 'Ctrl+S'), '保存'),
+                    h('div', null, h('kbd', null, 'M'), '选区  ', h('kbd', null, 'Ctrl+A'), '全选'),
+                    h('div', null, h('kbd', null, 'Shift'), '+ 拖动', ' 移内容'),
+                    h('div', null, h('kbd', null, 'Del'), '删除  ', h('kbd', null, 'Esc'), '取消')));
 
             const leftPanel = h('div', { className: 'pxs-panel pxs-panel-left' },
                 toolsSection, brushSection, layerSection, canvasSection, keysSection);
@@ -2678,7 +3149,10 @@ window.__ModuleLoader__.load({
                 onPointerMove,
                 onPointerUp,
                 onPointerCancel: onPointerUp,
-                onContextMenu: (event) => event.preventDefault(),
+                onContextMenu: (event) => {
+                    event.preventDefault();
+                    if (selectionRef.current) selectApiRef.current.cancel();
+                },
                 onDragStart: (event) => event.preventDefault(),
             });
 
@@ -2694,8 +3168,49 @@ window.__ModuleLoader__.load({
 
             const loadingNode = loading ? h('div', { className: 'pxs-empty' }, h('p', null, '加载作品中…')) : null;
 
+            const selectionBar = selection ? h('div', { className: 'pxs-selection-bar' },
+                h('span', { className: 'pxs-selection-label' },
+                    `${selection.w}×${selection.h} @ ${selection.x},${selection.y}`),
+                h('button', {
+                    className: 'pxs-btn',
+                    onClick: () => selectApiRef.current.apply('mirror-h', allLayersRef.current),
+                    title: '水平镜像 (Shift+H)',
+                }, '⇆ 水平镜像'),
+                h('button', {
+                    className: 'pxs-btn',
+                    onClick: () => selectApiRef.current.apply('mirror-v', allLayersRef.current),
+                    title: '垂直镜像 (Shift+V)',
+                }, '⇅ 垂直镜像'),
+                h('button', {
+                    className: 'pxs-btn',
+                    onClick: () => selectApiRef.current.apply('fill', allLayersRef.current),
+                    title: '用当前颜色填充 (Shift+F)',
+                }, '▣ 填充'),
+                h('button', {
+                    className: 'pxs-btn',
+                    onClick: () => selectApiRef.current.apply('delete', allLayersRef.current),
+                    title: '删除选区内容 (Delete)',
+                }, '⌫ 删除'),
+                h('button', {
+                    className: 'pxs-btn',
+                    'data-active': grabMode,
+                    title: '抓着像素拖动（也可以 Shift+拖动）',
+                    onClick: () => setGrabMode((value) => !value),
+                }, grabMode ? '✱ 抓着：开' : '✱ 抓着像素'),
+                h('button', {
+                    className: 'pxs-btn',
+                    'data-active': allLayersMode,
+                    title: '镜像 / 填充 / 删除作用于所有可见图层（也可以按住 Alt）',
+                    onClick: () => setAllLayersMode((value) => !value),
+                }, allLayersMode ? '多层：开' : '多层'),
+                h('button', {
+                    className: 'pxs-btn',
+                    onClick: () => selectApiRef.current.cancel(),
+                    title: '取消选区 (Esc)',
+                }, '✕')) : null;
+
             const stageNode = h('div', { className: 'pxs-stage', ref: stageRef },
-                canvasNode, emptyNode, loadingNode);
+                canvasNode, emptyNode, loadingNode, selectionBar);
 
             const colorSection = h('div', { className: 'pxs-section' },
                 h('p', { className: 'pxs-title' }, '当前颜色'),
@@ -3233,6 +3748,23 @@ window.__ModuleLoader__.load({
                             onClick: () => window.location.reload(),
                         }, '刷新页面'))));
             }
+        }
+
+        // Test hook: tools/select-test.cjs drives the pure selection helpers.
+        if (window.__PXS_TEST__) {
+            window.__PXS_TEST__.selection = {
+                selectionBetween,
+                clampRectangle,
+                moveRectangle,
+                pointInRectangle,
+                readRegion,
+                writeRegion,
+                blankRegion,
+                fillRows,
+                emptyRows,
+                mirrorRows,
+                mergedRegion,
+            };
         }
 
         return {
