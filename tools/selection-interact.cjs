@@ -1,0 +1,739 @@
+/**
+ * Selection interaction harness for the Pixel Studio client module.
+ *
+ * render-smoke.cjs proves the first render; interact-smoke.cjs drives dialog and
+ * palette flows. This harness drives the *canvas pointer* flows of the selection
+ * tool (create / move frame / carry pixels / mirror / fill / delete) against a
+ * stateful mini-React plus a fake Host, so wiring bugs in the new selection code
+ * show up without a browser.
+ *
+ * Geometry: the fake stage is 200×200 CSS pixels, the document is 8×8, so
+ * fitToView() picks scale 16 and pan 36. cell(client) = floor((client - 36) / 16),
+ * therefore cellCentre(n) = 36 + n * 16 + 8.
+ *
+ * Usage: node selection-interact.cjs
+ */
+
+const fs = require('node:fs');
+const path = require('node:path');
+const vm = require('node:vm');
+
+const CLIENT = path.resolve(__dirname, '..', 'client.js');
+
+const STAGE_SIZE = 200;
+const CELL = 16;
+const PAN = 36;
+
+/* -------------------------------------------------------------------------- */
+/* browser + host stubs                                                       */
+/* -------------------------------------------------------------------------- */
+
+const storage = new Map();
+const queue = [];
+const listeners = new Map();
+
+function makeContext() {
+    return {
+        createImageData: (w, h) => ({ data: new Uint8ClampedArray(w * h * 4), width: w, height: h }),
+        putImageData: () => {},
+        getImageData: (x, y, w, h) => ({ data: new Uint8ClampedArray(w * h * 4), width: w, height: h }),
+        setTransform: () => {},
+        translate: () => {},
+        scale: () => {},
+        drawImage: () => {},
+        clearRect: () => {},
+        fillRect: () => {},
+        strokeRect: () => {},
+        beginPath: () => {},
+        rect: () => {},
+        clip: () => {},
+        save: () => {},
+        restore: () => {},
+        moveTo: () => {},
+        lineTo: () => {},
+        stroke: () => {},
+        setLineDash: () => {},
+        lineDashOffset: 0,
+        imageSmoothingEnabled: true,
+        set lineWidth(_value) {},
+        set strokeStyle(_value) {},
+        set fillStyle(_value) {},
+    };
+}
+
+function makeCanvas() {
+    const context = makeContext();
+    return {
+        tagName: 'CANVAS',
+        width: 300,
+        height: 150,
+        style: {},
+        classList: { add: () => {}, remove: () => {}, toggle: () => {} },
+        getContext: () => context,
+        getBoundingClientRect: () => ({ left: 0, top: 0, width: STAGE_SIZE, height: STAGE_SIZE }),
+        setPointerCapture: () => {},
+        releasePointerCapture: () => {},
+        addEventListener: () => {},
+        removeEventListener: () => {},
+        appendChild: () => {},
+        removeChild: () => {},
+    };
+}
+
+const stageListeners = new Map();
+
+const stageElement = {
+    tagName: 'DIV',
+    style: {},
+    clientWidth: STAGE_SIZE,
+    clientHeight: STAGE_SIZE,
+    classList: { add: () => {}, remove: () => {}, toggle: () => {} },
+    getBoundingClientRect: () => ({ left: 0, top: 0, width: STAGE_SIZE, height: STAGE_SIZE }),
+    addEventListener: (type, handler) => {
+        if (!stageListeners.has(type)) stageListeners.set(type, []);
+        stageListeners.get(type).push(handler);
+    },
+    removeEventListener: (type, handler) => {
+        const list = stageListeners.get(type) || [];
+        const index = list.indexOf(handler);
+        if (index >= 0) list.splice(index, 1);
+    },
+    appendChild: () => {},
+    removeChild: () => {},
+};
+
+const windowStub = {
+    devicePixelRatio: 1,
+    innerWidth: 1440,
+    innerHeight: 900,
+    localStorage: {
+        getItem: (key) => (storage.has(key) ? storage.get(key) : null),
+        setItem: (key, value) => storage.set(key, String(value)),
+        removeItem: (key) => storage.delete(key),
+    },
+    requestAnimationFrame: (fn) => {
+        queue.push(() => fn(0));
+        return 1;
+    },
+    cancelAnimationFrame: () => {},
+    setTimeout: (fn, delay) => {
+        // Debounced work (save) must run; long housekeeping timers (notice
+        // auto-clear after 6s) are dropped so the text stays observable.
+        if (typeof delay === 'number' && delay > 1500) return -1;
+        queue.push(fn);
+        return 1;
+    },
+    clearTimeout: () => {},
+    addEventListener: (type, fn) => {
+        if (!listeners.has(type)) listeners.set(type, new Set());
+        listeners.get(type).add(fn);
+    },
+    removeEventListener: (type, fn) => {
+        const set = listeners.get(type);
+        if (set) set.delete(fn);
+    },
+    matchMedia: () => ({ matches: false, addEventListener: () => {}, removeEventListener: () => {} }),
+    location: { reload: () => {} },
+    confirm: () => true,
+    getComputedStyle: () => ({ getPropertyValue: () => '' }),
+};
+
+const documentStub = {
+    createElement: (tag) => (String(tag).toLowerCase() === 'canvas' ? makeCanvas() : {
+        tagName: String(tag).toUpperCase(),
+        style: {},
+        classList: { add: () => {}, remove: () => {} },
+        width: 0,
+        height: 0,
+        getContext: () => makeContext(),
+        getBoundingClientRect: () => ({ left: 0, top: 0, width: STAGE_SIZE, height: STAGE_SIZE }),
+        addEventListener: () => {},
+        removeEventListener: () => {},
+        appendChild: () => {},
+        removeChild: () => {},
+    }),
+    addEventListener: () => {},
+    body: { appendChild: () => {}, removeChild: () => {} },
+};
+
+/* -------------------------------------------------------------------------- */
+/* fake host API                                                              */
+/* -------------------------------------------------------------------------- */
+
+const palette = ['#101010', '#202020', '#303030', '#404040', '#505050', '#606060', '#707070', '#808080'];
+
+const state = {
+    docs: [
+        {
+            id: 'doc1',
+            name: '选区测试',
+            w: 8,
+            h: 8,
+            filePath: null,
+            palette: palette.slice(),
+            layers: [
+                {
+                    name: '图层 1',
+                    visible: true,
+                    rows: ['........', '.0......', '........', '........', '........', '........', '........', '........'],
+                },
+            ],
+        },
+    ],
+};
+
+function summarize(doc) {
+    return {
+        id: doc.id,
+        name: doc.name,
+        w: doc.w,
+        h: doc.h,
+        filePath: doc.filePath || null,
+        colors: doc.palette.length,
+        layers: doc.layers.length,
+        savedAt: 1,
+    };
+}
+
+const fetchStub = (url, options = {}) => {
+    const body = JSON.parse(options.body || '{}');
+    const reply = (payload) => Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve(payload) });
+    switch (body.op) {
+        case 'list':
+            return reply({ ok: true, docs: state.docs.map(summarize) });
+        case 'get': {
+            const doc = state.docs.find((entry) => entry.id === body.id);
+            return reply(doc ? { ok: true, doc } : { ok: false, error: 'not-found' });
+        }
+        case 'save': {
+            const incoming = body.doc || {};
+            const existing = state.docs.find((entry) => entry.id === incoming.id);
+            if (!existing) return reply({ ok: false, error: 'not-found' });
+            Object.assign(existing, {
+                name: incoming.name || existing.name,
+                palette: (incoming.palette || existing.palette).slice(),
+                layers: (incoming.layers || existing.layers).map((layer) => ({ ...layer, rows: layer.rows.slice() })),
+                w: incoming.w || existing.w,
+                h: incoming.h || existing.h,
+                filePath: incoming.filePath === undefined ? existing.filePath : incoming.filePath,
+            });
+            return reply({ ok: true, doc: existing, savedAt: 2 });
+        }
+        case 'sessionDir':
+            return reply({ ok: true, path: 'D:\\fake\\session' });
+        case 'exportTo':
+            return reply({ ok: true, path: `${body.path}.png`, width: 8, height: 8, bytes: 90, overwritten: false });
+        default:
+            return reply({ ok: false, error: 'unknown-op', message: body.op });
+    }
+};
+
+/* -------------------------------------------------------------------------- */
+/* stateful react stub                                                        */
+/* -------------------------------------------------------------------------- */
+
+const react = {
+    createElement(type, props, ...children) {
+        return { type, props: { ...(props || {}), children: children.length <= 1 ? children[0] : children } };
+    },
+    Fragment: 'Fragment',
+};
+
+let hooks = [];
+let hookIndex = 0;
+let effects = [];
+let dirty = false;
+let renderCap = 0;
+
+function scheduleDirty() {
+    dirty = true;
+}
+
+react.useState = (initial) => {
+    const slot = hookIndex;
+    hookIndex += 1;
+    if (!(slot in hooks)) hooks[slot] = typeof initial === 'function' ? initial() : initial;
+    const set = (value) => {
+        const next = typeof value === 'function' ? value(hooks[slot]) : value;
+        if (next !== hooks[slot]) {
+            hooks[slot] = next;
+            scheduleDirty();
+        }
+    };
+    return [hooks[slot], set];
+};
+
+react.useRef = (initial) => {
+    const slot = hookIndex;
+    hookIndex += 1;
+    if (!(slot in hooks)) hooks[slot] = { current: initial };
+    return hooks[slot];
+};
+
+react.useMemo = (factory) => factory();
+
+react.useCallback = (fn, deps) => {
+    const slot = hookIndex;
+    hookIndex += 1;
+    const previous = hooks[slot];
+    if (previous && deps && sameDeps(previous.deps, deps)) return previous.fn;
+    hooks[slot] = { fn, deps };
+    return fn;
+};
+
+function sameDeps(a, b) {
+    if (!a || !b || a.length !== b.length) return false;
+    return a.every((entry, index) => Object.is(entry, b[index]));
+}
+
+react.useEffect = (fn, deps) => {
+    const slot = hookIndex;
+    hookIndex += 1;
+    effects.push({ slot, fn, deps });
+};
+
+react.useLayoutEffect = react.useEffect;
+react.useImperativeHandle = () => {};
+react.createContext = (value) => ({ Provider: 'Provider', Consumer: 'Consumer', _value: value });
+react.useContext = (context) => context && context._value;
+react.memo = (component) => component;
+react.forwardRef = (render) => render;
+react.Component = class Component {
+    constructor(props) {
+        this.props = props;
+        this.state = {};
+    }
+
+    setState(update) {
+        this.state = { ...this.state, ...(typeof update === 'function' ? update(this.state) : update) };
+    }
+};
+
+const effectState = new Map();
+
+let Component = null;
+let tree = null;
+
+function renderOnce() {
+    hookIndex = 0;
+    effects = [];
+    renderCap += 1;
+    if (renderCap > 400) throw new Error('render loop exceeded 400 passes');
+    tree = Component({ sessionId: 'session-test' });
+}
+
+function flushEffects() {
+    for (const effect of effects) {
+        const previous = effectState.get(effect.slot);
+        if (previous && sameDeps(previous.deps, effect.deps)) continue;
+        if (previous && typeof previous.cleanup === 'function') previous.cleanup();
+        const cleanup = effect.fn();
+        effectState.set(effect.slot, { deps: effect.deps, cleanup });
+    }
+}
+
+async function pump(label) {
+    let idlePasses = 0;
+    for (let pass = 0; pass < 120; pass += 1) {
+        await new Promise((resolve) => setImmediate(resolve));
+        const work = queue.splice(0, queue.length);
+        if (work.length > 0) idlePasses = 0;
+        for (const task of work) {
+            try {
+                task();
+            } catch (error) {
+                throw new Error(`${label}: queued work threw — ${error && error.message}`);
+            }
+        }
+        flushEffects();
+        if (dirty) {
+            renderOnce();
+            dirty = false;
+            idlePasses = 0;
+            continue;
+        }
+        idlePasses += 1;
+        if (idlePasses >= 3 && work.length === 0) return;
+    }
+    throw new Error(`${label}: pump did not settle`);
+}
+
+/* -------------------------------------------------------------------------- */
+/* tree helpers                                                               */
+/* -------------------------------------------------------------------------- */
+
+function childrenOf(node) {
+    const value = node && node.props ? node.props.children : null;
+    return flatten(value);
+}
+
+function flatten(value, out = []) {
+    if (Array.isArray(value)) {
+        for (const entry of value) flatten(entry, out);
+        return out;
+    }
+    if (value === undefined || value === null || value === false || value === true) return out;
+    out.push(value);
+    return out;
+}
+
+function walk(node, visit) {
+    if (!node || typeof node !== 'object') return;
+    if (!node.props) return;
+    visit(node);
+    for (const child of childrenOf(node)) walk(child, visit);
+}
+
+function textOf(node) {
+    if (typeof node === 'string' || typeof node === 'number') return String(node);
+    if (!node || typeof node !== 'object') return '';
+    return childrenOf(node).map(textOf).join('');
+}
+
+function findAll(predicate) {
+    const found = [];
+    walk(tree, (node) => {
+        if (predicate(node)) found.push(node);
+    });
+    return found;
+}
+
+function byClass(name) {
+    return findAll((node) => typeof node.props.className === 'string'
+        && node.props.className.split(/\s+/).includes(name));
+}
+
+function byText(text, tag) {
+    return findAll((node) => (!tag || node.type === tag) && textOf(node).trim() === text);
+}
+
+/* -------------------------------------------------------------------------- */
+/* geometry + input helpers                                                   */
+/* -------------------------------------------------------------------------- */
+
+function cellCentre(index) {
+    return PAN + index * CELL + CELL / 2;
+}
+
+function attachRefs() {
+    const canvas = byClass('pxs-canvas')[0];
+    const stage = byClass('pxs-stage')[0];
+    if (!canvas || !stage) throw new Error('canvas/stage node missing');
+    canvas.props.ref.current = makeCanvas();
+    stage.props.ref.current = stageElement;
+}
+
+function pointer(type, cellX, cellY, extra = {}) {
+    const canvas = byClass('pxs-canvas')[0];
+    const handler = canvas && canvas.props[type];
+    if (typeof handler !== 'function') throw new Error(`canvas has no ${type}`);
+    const event = {
+        pointerId: 1,
+        button: 0,
+        clientX: cellCentre(cellX),
+        clientY: cellCentre(cellY),
+        shiftKey: false,
+        altKey: false,
+        metaKey: false,
+        ctrlKey: false,
+        preventDefault: () => {},
+        stopPropagation: () => {},
+        setPointerCapture: () => {},
+        releasePointerCapture: () => {},
+        ...extra,
+    };
+    event.currentTarget = canvas.props.ref.current;
+    handler(event);
+}
+
+function key(name, extra = {}) {
+    const set = listeners.get('keydown');
+    if (!set) throw new Error('keydown listener not registered');
+    const event = {
+        key: name,
+        code: name.length === 1 ? `Key${name.toUpperCase()}` : name,
+        shiftKey: false,
+        altKey: false,
+        metaKey: false,
+        ctrlKey: false,
+        preventDefault: () => {},
+        ...extra,
+    };
+    for (const handler of [...set]) handler(event);
+}
+
+function wheel(deltaY, extra = {}) {
+    const set = stageListeners.get('wheel');
+    if (!set || set.length === 0) throw new Error('wheel listener not registered');
+    const event = {
+        deltaY,
+        deltaMode: 0,
+        clientX: STAGE_SIZE / 2,
+        clientY: STAGE_SIZE / 2,
+        shiftKey: false,
+        altKey: false,
+        metaKey: false,
+        ctrlKey: false,
+        preventDefault: () => {},
+        stopPropagation: () => {},
+        ...extra,
+    };
+    event.currentTarget = stageElement;
+    for (const handler of [...set]) handler(event);
+}
+
+function zoomLabel() {
+    const node = byClass('pxs-hex').find((entry) => /^\d+×$/.test(textOf(entry).trim()));
+    return node ? textOf(node).trim() : null;
+}
+
+function noticeText() {
+    const node = byClass('pxs-notice')[0];
+    return node ? String(node.props.title || '') : '';
+}
+
+function selectionLabel() {
+    const label = byClass('pxs-selection-label')[0];
+    return label ? textOf(label).trim() : null;
+}
+
+function rows() {
+    return state.docs[0].layers[0].rows.slice();
+}
+
+function rowAt(x, y) {
+    return rows()[y][x];
+}
+
+/* -------------------------------------------------------------------------- */
+/* run                                                                        */
+/* -------------------------------------------------------------------------- */
+
+let failures = 0;
+function check(labelValue, condition, detail) {
+    if (condition) {
+        console.log(`  ok   ${labelValue}`);
+        return;
+    }
+    failures += 1;
+    console.log(`  FAIL ${labelValue}${detail === undefined ? '' : ` — ${detail}`}`);
+}
+
+function loadModule() {
+    let definition = null;
+    windowStub.__ModuleLoader__ = { load: (def) => { definition = def; } };
+    const sandbox = {
+        window: windowStub,
+        document: documentStub,
+        console,
+        HTMLElement: class {},
+        ResizeObserver: class {
+            observe() {}
+            disconnect() {}
+        },
+        fetch: fetchStub,
+        setTimeout: windowStub.setTimeout,
+        clearTimeout: windowStub.clearTimeout,
+        requestAnimationFrame: windowStub.requestAnimationFrame,
+        cancelAnimationFrame: windowStub.cancelAnimationFrame,
+        Uint8Array,
+        Uint8ClampedArray,
+        Math,
+        Date,
+        JSON,
+        Number,
+        String,
+        Array,
+        Object,
+        Error,
+        Promise,
+        Map,
+        Set,
+    };
+    sandbox.globalThis = sandbox;
+    sandbox.self = sandbox;
+    vm.createContext(sandbox);
+    vm.runInContext(fs.readFileSync(CLIENT, 'utf8'), sandbox, { filename: CLIENT });
+    return definition;
+}
+
+(async () => {
+    const definition = loadModule();
+    if (!definition) {
+        console.error('FAIL: client.js never called window.__ModuleLoader__.load');
+        process.exit(1);
+    }
+
+    const clientModule = definition.factory((name) => {
+        if (name === 'react') return react;
+        throw new Error(`unexpected require(${name})`);
+    });
+
+    let registered = null;
+    clientModule.apply({
+        slots: {
+            inject: (name, factory) => factory(),
+            register: (meta, component) => {
+                registered = { meta, component };
+                return () => {};
+            },
+        },
+    });
+
+    const Boundary = registered.component;
+    const boundaryInstance = new Boundary({ sessionId: 'session-test' });
+    boundaryInstance.setState = (update) => {
+        boundaryInstance.state = {
+            ...boundaryInstance.state,
+            ...(typeof update === 'function' ? update(boundaryInstance.state) : update),
+        };
+    };
+    const innerElement = boundaryInstance.render();
+    Component = innerElement.type;
+
+    renderOnce();
+    await pump('mount');
+
+    attachRefs();
+    // React mounts refs before effects, but this harness attaches them afterwards;
+    // clean up the effects that ran without a stage, then let them mount again so
+    // wheel/observer listeners bind to the real stage like they would in a browser.
+    for (const entry of effectState.values()) {
+        if (entry && typeof entry.cleanup === 'function') entry.cleanup();
+    }
+    effectState.clear();
+    await pump('refs');
+
+    // Fit the view now that the stage has a size (8×8 doc → scale 16, pan 36).
+    const fitButton = byText('适应').find((node) => node.type === 'button');
+    check('fit-to-view button exists', Boolean(fitButton));
+    if (fitButton) fitButton.props.onClick({ preventDefault() {}, stopPropagation() {} });
+    await pump('fit');
+
+    // Pick the selection tool exactly like a user does.
+    const selectTool = findAll((node) => node.type === 'button'
+        && typeof node.props.title === 'string'
+        && node.props.title.startsWith('选区'))[0];
+    check('selection tool button exists', Boolean(selectTool));
+    if (selectTool) selectTool.props.onClick({ preventDefault() {}, stopPropagation() {} });
+    await pump('select-tool');
+
+    /* 1. drag a rectangle ------------------------------------------------ */
+    pointer('onPointerDown', 1, 1);
+    pointer('onPointerMove', 3, 3);
+    pointer('onPointerUp', 3, 3);
+    await pump('create-selection');
+    check('drag creates a 3×3 selection at 1,1', selectionLabel() === '3×3 @ 1,1', selectionLabel());
+
+    /* 2. dragging inside slides the frame, not the pixels ---------------- */
+    pointer('onPointerDown', 2, 2);
+    pointer('onPointerMove', 4, 4);
+    pointer('onPointerUp', 4, 4);
+    await pump('move-frame');
+    check('dragging inside moves the frame', selectionLabel() === '3×3 @ 3,3', selectionLabel());
+    check('frame-only drag leaves the pixel in place', rowAt(1, 1) === '0', rows()[1]);
+
+    /* 3. Shift+drag carries the pixels ----------------------------------- */
+    pointer('onPointerDown', 1, 1);
+    pointer('onPointerMove', 2, 1);
+    pointer('onPointerUp', 2, 1);
+    await pump('reselect');
+    check('second drag selects 2×1 at 1,1', selectionLabel() === '2×1 @ 1,1', selectionLabel());
+    pointer('onPointerDown', 1, 1, { shiftKey: true });
+    pointer('onPointerMove', 5, 5, { shiftKey: true });
+    pointer('onPointerUp', 5, 5, { shiftKey: true });
+    await pump('carry');
+    check('shift+drag lands the pixels at 5,5', rowAt(5, 5) === '0', rows()[5]);
+    check('shift+drag clears the source pixel', rowAt(1, 1) === '.', rows()[1]);
+
+    /* 4. delete the carried pixel, then fill / mirror --------------------- */
+    key('Delete');
+    await pump('delete');
+    check('Delete empties the selected cell', rowAt(5, 5) === '.', rows()[5]);
+
+    key('a', { metaKey: true });
+    await pump('select-all');
+    check('Ctrl+A selects the whole canvas', selectionLabel() === '8×8 @ 0,0', selectionLabel());
+    key('f', { shiftKey: true });
+    await pump('fill');
+    check('Shift+F fills the whole canvas', rows()[0] === '00000000', rows()[0]);
+    key('h', { shiftKey: true });
+    await pump('mirror');
+    check('Shift+H keeps a uniform fill unchanged', rows()[0] === '00000000', rows()[0]);
+
+    /* 5. Esc clears the selection ---------------------------------------- */
+    key('Escape');
+    await pump('escape');
+    check('Esc clears the selection', selectionLabel() === null, selectionLabel());
+
+    /* 6. copy / paste moves pixels through the clipboard ------------------- */
+    pointer('onPointerDown', 0, 0);
+    pointer('onPointerMove', 1, 0);
+    pointer('onPointerUp', 1, 0);
+    await pump('clip-select');
+    check('can select a 2×1 block at 0,0', selectionLabel() === '2×1 @ 0,0', selectionLabel());
+    key('c', { metaKey: true });
+    await pump('copy');
+    check('Ctrl+C reports the copied size', noticeText().includes('已复制'), noticeText());
+
+    pointer('onPointerDown', 0, 0);
+    pointer('onPointerMove', 4, 4);
+    pointer('onPointerUp', 4, 4);
+    await pump('clip-move');
+    check('the frame can be parked at 4,4', selectionLabel() === '2×1 @ 4,4', selectionLabel());
+    key('v', { metaKey: true });
+    await pump('paste');
+    check('Ctrl+V writes the clipboard at the frame', rowAt(4, 4) === '0' && rowAt(5, 4) === '0', rows()[4]);
+    check('Ctrl+V reports the paste', noticeText().includes('已粘贴'), noticeText());
+
+    /* 7. cut keeps the pixels visible until they are landed ----------------- */
+    key('x', { metaKey: true });
+    await pump('cut');
+    check('Ctrl+X reports the cut', noticeText().includes('已剪切'), noticeText());
+    check('Ctrl+X keeps the pixels on the canvas', rows()[4] === '00000000' && selectionLabel() !== null, `${rows()[4]} · ${selectionLabel()}`);
+    check('the cut block is floating', selectionLabel() === '2×1 @ 4,4', selectionLabel());
+    key('ArrowRight');
+    key('ArrowRight');
+    await pump('nudge-cut');
+    check('the floating block follows the frame', selectionLabel() === '2×1 @ 6,4', selectionLabel());
+    const finishButton = byText('✓ 完成').find((node) => node.type === 'button');
+    check('the 完成 button exists', Boolean(finishButton));
+    if (finishButton) finishButton.props.onClick({ preventDefault() {}, stopPropagation() {} });
+    await pump('finish-cut');
+    check('完成 lands the cut pixels at their new home', rows()[4] === '0000..00', rows()[4]);
+    check('完成 ends the selection', selectionLabel() === null, selectionLabel());
+
+    /* 8. undo brings the lifted pixels back ---------------------------------- */
+    key('z', { metaKey: true });
+    await pump('undo');
+    check('undo clears the stale selection', selectionLabel() === null, selectionLabel());
+    check('undo restores the pre-cut rows', rows()[4] === '00000000', rows()[4]);
+
+    /* 9. a wheel event in the middle of a drag must not zoom ------------------------------------------------------------------ */
+    const zoomBefore = zoomLabel();
+    pointer('onPointerDown', 2, 2);
+    await pump('drag-begin');
+    wheel(-120);
+    wheel(-120, { shiftKey: true });
+    await pump('drag-wheel');
+    check('wheel during a drag keeps the zoom', zoomLabel() === zoomBefore, `${zoomBefore} → ${zoomLabel()}`);
+    check('wheel during a drag keeps the frame', selectionLabel() === '1×1 @ 2,2', selectionLabel());
+    pointer('onPointerUp', 2, 2);
+    await pump('drag-end');
+
+    /* 10. a plain wheel still zooms when nothing is dragging --------------- */
+    key('Escape');
+    await pump('escape-2');
+    wheel(-120);
+    await pump('plain-wheel');
+    check('wheel without a drag still zooms', zoomLabel() !== zoomBefore, `${zoomBefore} → ${zoomLabel()}`);
+
+    console.log(failures === 0 ? 'PASS: selection interactions behave' : `FAIL: ${failures} check(s) failed`);
+    process.exit(failures === 0 ? 0 : 1);
+})().catch((error) => {
+    console.error('FAIL: harness threw');
+    console.error(error && error.stack ? error.stack : error);
+    process.exit(1);
+});
+
+

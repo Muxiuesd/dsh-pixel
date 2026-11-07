@@ -35,8 +35,9 @@ dsh plugin --profile web add /绝对路径/dsh-pixel
 | `B` / `E` / `G` / `I` | 铅笔 / 橡皮 / 油漆桶 / 吸管 |
 | `M` | 矩形选区 |
 | `Ctrl/Cmd+A` | 全选选区 |
-| `Esc` | 取消选区 |
+| `Esc` | 取消选区（浮动的内容回到原处） |
 | `Delete` / `Backspace` | 删除选区内像素 |
+| `Ctrl/Cmd+C` / `Ctrl/Cmd+X` / `Ctrl/Cmd+V` | 复制 / 剪切（内容留在画布上） / 粘贴 |
 | `Shift + H` / `Shift + V` / `Shift + F` | 选区水平镜像 / 垂直镜像 / 填充 |
 | 方向键（配合选区） | 微调选区 1 像素，`Shift` 为 10 像素 |
 | `[` `]` | 笔刷变小 / 变大 |

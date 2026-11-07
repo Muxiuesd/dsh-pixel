@@ -511,6 +511,69 @@ window.__ModuleLoader__.load({
             return region;
         }
 
+        /** Stacks regions bottom-first; transparent cells let the lower region show through. */
+        function overlayRegions(regions) {
+            const height = regions.length === 0 ? 0 : regions[0].length;
+            const width = height === 0 ? 0 : regions[0][0].length;
+            const out = [];
+            for (let y = 0; y < height; y += 1) {
+                const chars = new Array(width).fill('.');
+                regions.forEach((region) => {
+                    const line = region[y] || '';
+                    for (let x = 0; x < width; x += 1) {
+                        const ch = line[x];
+                        if (ch && ch !== '.') chars[x] = ch;
+                    }
+                });
+                out.push(chars.join(''));
+            }
+            return out;
+        }
+
+        /* solid fills ------------------------------------------------------ */
+        /* Text that sits on a solid colour has to flip with that colour: white on
+         * dark fills, near-black on light ones. The fill often comes from a theme
+         * token, so the readable ink is resolved at runtime instead of guessed in
+         * CSS (a light theme can map "brand" to a bright yellow). */
+        function parseRgbColor(value) {
+            if (typeof value !== 'string') return null;
+            const match = value.match(/rgba?\(([^)]+)\)/i);
+            if (!match) return null;
+            const parts = match[1].split(/[,\s/]+/).filter(Boolean).map(Number);
+            if (parts.length < 3 || parts.slice(0, 3).some((part) => !Number.isFinite(part))) return null;
+            return { r: parts[0], g: parts[1], b: parts[2] };
+        }
+
+        function readableOn(color) {
+            const rgb = parseRgbColor(color);
+            if (!rgb) return '#ffffff';
+            const channel = (value) => {
+                const unit = clamp(value, 0, 255) / 255;
+                return unit <= 0.03928 ? unit / 12.92 : ((unit + 0.055) / 1.055) ** 2.4;
+            };
+            const luminance = 0.2126 * channel(rgb.r) + 0.7152 * channel(rgb.g) + 0.0722 * channel(rgb.b);
+            return luminance > 0.5 ? '#101216' : '#ffffff';
+        }
+
+        function resolveBrandInk(host) {
+            if (typeof document === 'undefined' || typeof window === 'undefined') return '#ffffff';
+            const parent = (host && typeof host.appendChild === 'function') ? host : document.body;
+            if (!parent || typeof parent.appendChild !== 'function') return '#ffffff';
+            if (typeof window.getComputedStyle !== 'function') return '#ffffff';
+            let probe = null;
+            try {
+                probe = document.createElement('span');
+                probe.style.cssText = 'position:absolute;left:-9999px;top:0;width:0;height:0;'
+                    + 'background:var(--dsw-alias-brand-primary, #4b7bec)';
+                parent.appendChild(probe);
+                return readableOn(window.getComputedStyle(probe).backgroundColor);
+            } catch (error) {
+                return '#ffffff';
+            } finally {
+                if (probe && typeof probe.remove === 'function') probe.remove();
+            }
+        }
+
         /* ------------------------------------------------------------------ */
         /* image import                                                       */
         /* ------------------------------------------------------------------ */
@@ -990,14 +1053,25 @@ window.__ModuleLoader__.load({
 }
 .pxs-selection-bar {
   position: absolute; left: 10px; right: 10px; bottom: 10px; z-index: 3;
-  display: flex; flex-wrap: wrap; align-items: center; gap: 6px;
+  display: flex; flex-direction: column; gap: 5px;
   padding: 6px 8px; border-radius: 9px;
   background: var(--dsw-alias-bg-overlay, rgba(38, 42, 51, .9));
   border: 1px solid var(--dsw-alias-border-l2, rgba(255, 255, 255, .2));
   box-shadow: 0 6px 20px rgba(0, 0, 0, .28);
   backdrop-filter: blur(6px);
 }
+.pxs-selection-row {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 4px;
+}
 .pxs-selection-bar .pxs-btn { height: 24px; padding: 0 8px; font-size: 11px; }
+.pxs-selection-divider {
+  width: 1px; height: 16px; margin: 0 4px;
+  background: var(--dsw-alias-border-l1, rgba(255, 255, 255, .16));
+}
+.pxs-selection-hint {
+  font-size: 10px; line-height: 1.5;
+  color: var(--dsw-alias-label-tertiary, rgba(255, 255, 255, .55));
+}
 .pxs-selection-label {
   font-size: 11px; margin-right: auto; color: var(--dsw-alias-label-secondary, #9aa1ad);
   font-variant-numeric: tabular-nums; white-space: nowrap;
@@ -1049,7 +1123,7 @@ window.__ModuleLoader__.load({
 .pxs-dialog-actions { display: flex; justify-content: flex-end; gap: 8px; }
 .pxs-btn-primary {
     background: var(--dsw-alias-brand-primary, #4b7bec); border-color: transparent;
-    color: #fff;
+    color: var(--pxs-on-brand, #fff);
 }
 .pxs-native-color {
     width: 40px; height: 28px; padding: 0; border: 1px solid var(--dsw-alias-border-l2, rgba(255, 255, 255, .18));
@@ -1142,6 +1216,12 @@ window.__ModuleLoader__.load({
         /* editor                                                             */
         /* ------------------------------------------------------------------ */
 
+        /**
+         * In-memory clipboard for the selection tool. Intentionally not persisted:
+         * a page reload should never paste stale pixels into another drawing.
+         */
+        let clipRegion = null;
+
         function PixelStudio(props) {
             const sessionId = props && typeof props.sessionId === 'string' ? props.sessionId : '';
             const [docs, setDocs] = useState([]);
@@ -1170,6 +1250,22 @@ window.__ModuleLoader__.load({
             const [selection, setSelection] = useState(null);
             const [grabMode, setGrabMode] = useState(false);
             const [allLayersMode, setAllLayersMode] = useState(false);
+            const [brandInk, setBrandInk] = useState(() => resolveBrandInk());
+            const rootRef = useRef(null);
+
+            useEffect(() => {
+                const sync = () => setBrandInk(resolveBrandInk(rootRef.current));
+                sync();
+                if (typeof MutationObserver !== 'function' || typeof document === 'undefined') return undefined;
+                if (!document.documentElement) return undefined;
+                const observer = new MutationObserver(sync);
+                const targets = [document.documentElement, document.body].filter(Boolean);
+                targets.forEach((target) => observer.observe(target, {
+                    attributes: true,
+                    attributeFilter: ['class', 'style', 'data-theme', 'data-ds-theme', 'data-color-scheme'],
+                }));
+                return () => observer.disconnect();
+            }, []);
 
             const stageRef = useRef(null);
             const canvasRef = useRef(null);
@@ -1275,6 +1371,10 @@ window.__ModuleLoader__.load({
 
             const paint = useCallback(() => {
                 frameRef.current = 0;
+                // Read through the ref so paints do not depend on the selection state
+                // identity: a changing callback here would cascade into fitToView →
+                // openDoc → the mount effect, reloading the document on every selection.
+                const selection = selectionRef.current;
                 const canvas = canvasRef.current;
                 const stage = stageRef.current;
                 const current = docRef.current;
@@ -1389,7 +1489,7 @@ window.__ModuleLoader__.load({
                 context.strokeStyle = 'rgba(255,255,255,0.22)';
                 context.lineWidth = 1;
                 context.strokeRect(Math.round(pan.x) + 0.5, Math.round(pan.y) + 0.5, Math.round(docWidth), Math.round(docHeight));
-            }, [composeImage, selection]);
+            }, [composeImage]);
 
             const requestPaint = useCallback(() => {
                 if (frameRef.current !== 0) return;
@@ -1433,6 +1533,8 @@ window.__ModuleLoader__.load({
 
             const openDoc = useCallback(async (id) => {
                 const data = await callApi({ op: 'get', id });
+                const previous = docRef.current;
+                const switched = !previous || previous.id !== data.doc.id;
                 setDoc(data.doc);
                 docRef.current = data.doc;
                 setLayerIndex(0);
@@ -1440,6 +1542,12 @@ window.__ModuleLoader__.load({
                 setEditing(null);
                 editingRef.current = null;
                 historyRef.current = { undo: [], redo: [] };
+                if (switched) {
+                    // Selection coordinates belong to the document that was open;
+                    // a late-arriving reload of the same document must not wipe it.
+                    selectionRef.current = null;
+                    setSelection(null);
+                }
                 setStatus('clean');
                 window.requestAnimationFrame(() => fitToView());
             }, [fitToView]);
@@ -1544,6 +1652,8 @@ window.__ModuleLoader__.load({
                 if (!snapshot) return;
                 const current = docRef.current;
                 history.redo.push(snapshotOf(current));
+                selectionRef.current = null;
+                setSelection(null);
                 applyHistory(snapshot);
             }, [applyHistory]);
 
@@ -1553,6 +1663,8 @@ window.__ModuleLoader__.load({
                 if (!snapshot) return;
                 const current = docRef.current;
                 history.undo.push(snapshotOf(current));
+                selectionRef.current = null;
+                setSelection(null);
                 applyHistory(snapshot);
             }, [applyHistory]);
 
@@ -1640,14 +1752,14 @@ window.__ModuleLoader__.load({
             const setSelectionRect = useCallback((rect) => {
                 selectionRef.current = rect;
                 setSelection(rect);
-            }, []);
+                requestPaint();
+            }, [requestPaint]);
 
             const selectAll = useCallback(() => {
                 const current = docRef.current;
                 if (!current) return;
                 setTool('select');
                 setSelectionRect({ x: 0, y: 0, w: current.w, h: current.h, float: null });
-                setStatus('select');
                 requestPaint();
             }, [requestPaint, setSelectionRect]);
 
@@ -1699,7 +1811,9 @@ window.__ModuleLoader__.load({
                 setSelectionRect({
                     ...rect,
                     float: {
-                        region: mergedRegion(current.layers, rect),
+                        // Only the lifted layers, so pixels of untouched layers are not
+                        // copied into the destination when the selection is dropped.
+                        region: overlayRegions(items.map((item) => item.region)),
                         origin: { x: rect.x, y: rect.y },
                         targets: items,
                     },
@@ -1731,16 +1845,32 @@ window.__ModuleLoader__.load({
                 const current = docRef.current;
                 const active = selectionRef.current;
                 if (!current || !active) return;
+                let base = current;
                 if (active.float) {
-                    const restored = putBackLifted(current, active);
-                    docRef.current = restored;
-                    setDoc(restored);
+                    const floating = clampRectangle(active, base.w, base.h);
+                    if (mode === 'delete') {
+                        // The lift already pushed its own history entry, so dropping the float
+                        // without writing it back is exactly "these pixels are gone".
+                        setSelectionRect({ ...floating, float: null });
+                        setStatus('dirty');
+                        scheduleSave();
+                        return;
+                    }
+                    const float = active.float;
+                    const committed = base.layers.map((layer, index) => {
+                        const item = float.targets.find((entry) => entry.index === index);
+                        if (!item) return layer;
+                        return { ...layer, rows: writeRegion(layer.rows, item.region, floating.x, floating.y) };
+                    });
+                    base = { ...base, layers: committed };
+                    docRef.current = base;
+                    setDoc(base);
                 }
-                const base = docRef.current;
                 const rect = clampRectangle(active, base.w, base.h);
                 const targets = selectionTargets(allLayers);
                 if (targets.length === 0) return;
-                pushHistory();
+                // A committed float already pushed its own undo entry during the lift.
+                if (!active.float) pushHistory();
                 const layers = base.layers.map((layer, index) => {
                     const target = targets.find((entry) => entry.index === index);
                     if (!target) return layer;
@@ -1757,7 +1887,7 @@ window.__ModuleLoader__.load({
                 setSelectionRect({ ...rect, float: null });
                 setStatus('dirty');
                 scheduleSave();
-            }, [putBackLifted, pushHistory, scheduleSave, selectionTargets, setSelectionRect]);
+            }, [pushHistory, scheduleSave, selectionTargets, setSelectionRect]);
 
             /** Arrow-key nudging: 1 cell, 10 with Shift; carries lifted pixels along. */
             const nudgeSelection = useCallback((dx, dy) => {
@@ -1766,8 +1896,86 @@ window.__ModuleLoader__.load({
                 if (!current || !active) return;
                 const rect = moveRectangle(active, active.x + dx, active.y + dy, current.w, current.h);
                 setSelectionRect({ ...rect, float: active.float });
-                setStatus('select');
             }, [setSelectionRect]);
+
+            /** Copy what the selection shows (floating pixels win) into the clipboard. */
+            const copySelection = useCallback(() => {
+                const current = docRef.current;
+                const active = selectionRef.current;
+                if (!current || !active) return false;
+                const rect = clampRectangle(active, current.w, current.h);
+                clipRegion = {
+                    w: rect.w,
+                    h: rect.h,
+                    rows: active.float
+                        ? active.float.region.map((row) => row.slice())
+                        : mergedRegion(current.layers, rect),
+                };
+                setNotice(`已复制 ${rect.w}×${rect.h}`);
+                return true;
+            }, []);
+
+            /**
+             * Cut keeps the pixels on the canvas: the content is copied and lifted into the
+             * floating selection, so it stays visible and can be dragged to its new home.
+             * Only 「完成」 (or dropping elsewhere) actually removes it from where it was.
+             */
+            const cutSelection = useCallback(() => {
+                const copied = copySelection();
+                if (!copied) return;
+                const lifted = liftSelection(allLayersRef.current);
+                setNotice(lifted
+                    ? '已剪切 · 内容还留在画布上，拖动选框然后点「完成」落地'
+                    : '已剪切 · 内容已在剪贴板里');
+            }, [copySelection, liftSelection]);
+
+            const finishSelection = useCallback(() => {
+                const active = selectionRef.current;
+                if (!active) return;
+                if (active.float) dropSelection();
+                selectionRef.current = null;
+                setSelection(null);
+                requestPaint();
+                scheduleSave();
+            }, [dropSelection, requestPaint, scheduleSave]);
+
+            const pasteClipboard = useCallback(() => {
+                const clipboard = clipRegion;
+                if (!clipboard) return;
+                const active = selectionRef.current;
+                // A floating selection is committed where it stands before pasting, otherwise
+                // the paste would silently throw the moved pixels back to their old home.
+                if (active && active.float) dropSelection();
+                const base = docRef.current;
+                if (!base) return;
+                const width = Math.min(clipboard.w, base.w);
+                const height = Math.min(clipboard.h, base.h);
+                const origin = active ? clampRectangle(active, base.w, base.h) : { x: 0, y: 0 };
+                const x = clamp(origin.x, 0, base.w - width);
+                const y = clamp(origin.y, 0, base.h - height);
+                const region = clipboard.rows
+                    .slice(0, height)
+                    .map((row) => row.padEnd(clipboard.w, '.').slice(0, width));
+                pushHistory();
+                const layers = base.layers.map((layer, index) => (index === layerRef.current
+                    ? { ...layer, rows: writeRegion(layer.rows, region, x, y) }
+                    : layer));
+                const next = { ...base, layers };
+                docRef.current = next;
+                setDoc(next);
+                setSelectionRect({ x, y, w: width, h: height, float: null });
+                setStatus('dirty');
+                scheduleSave();
+                setNotice(`已粘贴 ${width}×${height} @ (${x},${y})`);
+            }, [dropSelection, pushHistory, scheduleSave, setSelectionRect]);
+
+            const mirrorSelection = useCallback((horizontal) => {
+                applySelectionEdit(horizontal ? 'mirror-h' : 'mirror-v', allLayersRef.current);
+            }, [applySelectionEdit]);
+
+            const fillSelection = useCallback(() => {
+                applySelectionEdit('fill', allLayersRef.current);
+            }, [applySelectionEdit]);
 
             // Exposed to the keyboard effect, which is registered before these callbacks exist.
             selectApiRef.current = {
@@ -1777,6 +1985,12 @@ window.__ModuleLoader__.load({
                 nudge: nudgeSelection,
                 drop: dropSelection,
                 lift: liftSelection,
+                copy: copySelection,
+                cut: cutSelection,
+                paste: pasteClipboard,
+                mirror: mirrorSelection,
+                fill: fillSelection,
+                finish: finishSelection,
                 allLayers: allLayersRef.current,
             };
 
@@ -1810,7 +2024,7 @@ window.__ModuleLoader__.load({
                     const inside = active ? pointInRectangle(active, cell) : false;
                     const carry = event.shiftKey || grabRef.current;
                     event.currentTarget.setPointerCapture(event.pointerId);
-                    if (inside && carry && (active.float || liftSelection(event.altKey))) {
+                    if (inside && carry && (active.float || liftSelection(allLayersRef.current))) {
                         selectDragRef.current = {
                             mode: 'grab',
                             pointerId: event.pointerId,
@@ -1836,7 +2050,6 @@ window.__ModuleLoader__.load({
                             start: anchor,
                         };
                     }
-                    setStatus('select');
                     requestPaint();
                     return;
                 }
@@ -1953,6 +2166,9 @@ window.__ModuleLoader__.load({
                 const onWheel = (event) => {
                     if (!docRef.current) return;
                     event.preventDefault();
+                    // A drag owns the pointer: a trackpad that fires wheel events
+                    // mid-drag must not shove or rescale the canvas under the cursor.
+                    if (selectDragRef.current || strokeRef.current || panDrawRef.current) return;
                     if (event.shiftKey) {
                         panRef.current = {
                             x: panRef.current.x - event.deltaY,
@@ -2028,7 +2244,22 @@ window.__ModuleLoader__.load({
                         void saveNow();
                         return;
                     }
-                    if (meta) return;
+                    if (meta) {
+                        const combo = event.key.toLowerCase();
+                        const wantsSelection = selectionRef.current !== null;
+                        if ((combo === 'c' || combo === 'x') && wantsSelection) {
+                            event.preventDefault();
+                            if (combo === 'c') selectApiRef.current.copy();
+                            else selectApiRef.current.cut();
+                            return;
+                        }
+                        if (combo === 'v' && clipRegion !== null) {
+                            event.preventDefault();
+                            selectApiRef.current.paste();
+                            return;
+                        }
+                        return;
+                    }
                     const key = event.key.toLowerCase();
                     if (key === 'escape') {
                         selectApiRef.current.cancel();
@@ -2415,6 +2646,9 @@ window.__ModuleLoader__.load({
                 history.undo.push(snapshotOf(current));
                 if (history.undo.length > HISTORY_LIMIT) history.undo.shift();
                 history.redo = [];
+                // A selection in canvas coordinates would be meaningless after a resize.
+                selectionRef.current = null;
+                setSelection(null);
                 const layers = current.layers.map((layer) => ({
                     ...layer,
                     rows: resizeRows(layer.rows, current.w, current.h, width, height, dialog.anchor),
@@ -3169,45 +3403,70 @@ window.__ModuleLoader__.load({
             const loadingNode = loading ? h('div', { className: 'pxs-empty' }, h('p', null, '加载作品中…')) : null;
 
             const selectionBar = selection ? h('div', { className: 'pxs-selection-bar' },
-                h('span', { className: 'pxs-selection-label' },
-                    `${selection.w}×${selection.h} @ ${selection.x},${selection.y}`),
-                h('button', {
-                    className: 'pxs-btn',
-                    onClick: () => selectApiRef.current.apply('mirror-h', allLayersRef.current),
-                    title: '水平镜像 (Shift+H)',
-                }, '⇆ 水平镜像'),
-                h('button', {
-                    className: 'pxs-btn',
-                    onClick: () => selectApiRef.current.apply('mirror-v', allLayersRef.current),
-                    title: '垂直镜像 (Shift+V)',
-                }, '⇅ 垂直镜像'),
-                h('button', {
-                    className: 'pxs-btn',
-                    onClick: () => selectApiRef.current.apply('fill', allLayersRef.current),
-                    title: '用当前颜色填充 (Shift+F)',
-                }, '▣ 填充'),
-                h('button', {
-                    className: 'pxs-btn',
-                    onClick: () => selectApiRef.current.apply('delete', allLayersRef.current),
-                    title: '删除选区内容 (Delete)',
-                }, '⌫ 删除'),
-                h('button', {
-                    className: 'pxs-btn',
-                    'data-active': grabMode,
-                    title: '抓着像素拖动（也可以 Shift+拖动）',
-                    onClick: () => setGrabMode((value) => !value),
-                }, grabMode ? '✱ 抓着：开' : '✱ 抓着像素'),
-                h('button', {
-                    className: 'pxs-btn',
-                    'data-active': allLayersMode,
-                    title: '镜像 / 填充 / 删除作用于所有可见图层（也可以按住 Alt）',
-                    onClick: () => setAllLayersMode((value) => !value),
-                }, allLayersMode ? '多层：开' : '多层'),
-                h('button', {
-                    className: 'pxs-btn',
-                    onClick: () => selectApiRef.current.cancel(),
-                    title: '取消选区 (Esc)',
-                }, '✕')) : null;
+                h('div', { className: 'pxs-selection-row' },
+                    h('span', { className: 'pxs-selection-label' },
+                        `${selection.w}×${selection.h} @ ${selection.x},${selection.y}`),
+                    h('button', {
+                        className: 'pxs-btn',
+                        onClick: () => selectApiRef.current.cut(),
+                        title: '剪切选区内容到剪贴板 (Ctrl+X)',
+                    }, '✂ 剪切'),
+                    h('button', {
+                        className: 'pxs-btn',
+                        onClick: () => selectApiRef.current.copy(),
+                        title: '复制选区内容到剪贴板 (Ctrl+C)',
+                    }, '⧉ 复制'),
+                    h('button', {
+                        className: 'pxs-btn',
+                        onClick: () => selectApiRef.current.paste(),
+                        title: '把剪贴板内容粘贴到选区左上角 (Ctrl+V)',
+                    }, '⇩ 粘贴'),
+                    h('span', { className: 'pxs-selection-divider' }),
+                    h('button', {
+                        className: 'pxs-btn',
+                        onClick: () => selectApiRef.current.fill(),
+                        title: '用当前颜色填充选区 (Shift+F)',
+                    }, '▣ 填充'),
+                    h('button', {
+                        className: 'pxs-btn',
+                        onClick: () => selectApiRef.current.apply('delete', allLayersRef.current),
+                        title: '清空选区内容 (Delete)',
+                    }, '⌫ 清除'),
+                    h('button', {
+                        className: 'pxs-btn',
+                        onClick: () => selectApiRef.current.mirror(true),
+                        title: '选区内容水平镜像 (Shift+H)',
+                    }, '⇆ 镜像'),
+                    h('button', {
+                        className: 'pxs-btn',
+                        onClick: () => selectApiRef.current.mirror(false),
+                        title: '选区内容垂直镜像 (Shift+V)',
+                    }, '⇅ 镜像'),
+                    h('span', { className: 'pxs-selection-divider' }),
+                    h('button', {
+                        className: 'pxs-btn',
+                        'data-active': grabMode,
+                        title: '开启后，拖动选区会搬走像素（等同 Shift+拖动）',
+                        onClick: () => setGrabMode((value) => !value),
+                    }, grabMode ? '✓ 搬内容' : '搬内容'),
+                    h('button', {
+                        className: 'pxs-btn',
+                        'data-active': allLayersMode,
+                        title: '填充 / 清除 / 镜像作用于所有可见图层，而不只是当前图层',
+                        onClick: () => setAllLayersMode((value) => !value),
+                    }, allLayersMode ? '✓ 多层' : '多层'),
+                    h('button', {
+                        className: 'pxs-btn pxs-btn-primary',
+                        onClick: () => selectApiRef.current.finish(),
+                        title: '把浮动的内容落到当前位置并结束选区',
+                    }, '✓ 完成'),
+                    h('button', {
+                        className: 'pxs-btn',
+                        onClick: () => selectApiRef.current.cancel(),
+                        title: '放弃这次选区；浮动的内容回到原处 (Esc)',
+                    }, '✕ 取消')),
+                h('div', { className: 'pxs-selection-hint' },
+                    '拖动 = 移动选框　·　Shift + 拖动 = 搬走像素　·　剪切 = 内容留在画布上跟随选框　·　方向键 = 微调（Shift 10px）　·　Esc = 取消还原')) : null;
 
             const stageNode = h('div', { className: 'pxs-stage', ref: stageRef },
                 canvasNode, emptyNode, loadingNode, selectionBar);
@@ -3663,7 +3922,7 @@ window.__ModuleLoader__.load({
                         onClick: confirmResize,
                     }, '应用')))) : null;
 
-            return h('div', { className: 'pxs-root' },
+            return h('div', { className: 'pxs-root', ref: rootRef, style: { '--pxs-on-brand': brandInk } },
                 h('style', null, CSS),
                 barNode,
                 errorNode,
