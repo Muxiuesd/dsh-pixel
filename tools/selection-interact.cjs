@@ -32,7 +32,7 @@ const storage = new Map();
 const queue = [];
 const listeners = new Map();
 
-function makeContext() {
+function makeContext(rects) {
     return {
         createImageData: (w, h) => ({ data: new Uint8ClampedArray(w * h * 4), width: w, height: h }),
         putImageData: () => {},
@@ -43,7 +43,9 @@ function makeContext() {
         drawImage: () => {},
         clearRect: () => {},
         fillRect: () => {},
-        strokeRect: () => {},
+        strokeRect: (x, y, w, h) => {
+            if (Array.isArray(rects)) rects.push({ x, y, w, h });
+        },
         beginPath: () => {},
         rect: () => {},
         clip: () => {},
@@ -62,15 +64,19 @@ function makeContext() {
 }
 
 function makeCanvas() {
-    const context = makeContext();
+    // The last strokeRect of a paint pass is the artwork border: its position is
+    // what the zoom/centre checks read to confirm the canvas sits where expected.
+    const rects = [];
+    const context = makeContext(rects);
     return {
+        __rects: rects,
         tagName: 'CANVAS',
         width: 300,
         height: 150,
         style: {},
         classList: { add: () => {}, remove: () => {}, toggle: () => {} },
         getContext: () => context,
-        getBoundingClientRect: () => ({ left: 0, top: 0, width: STAGE_SIZE, height: STAGE_SIZE }),
+        getBoundingClientRect: () => ({ left: 0, top: 0, width: stageSize.width, height: stageSize.height }),
         setPointerCapture: () => {},
         releasePointerCapture: () => {},
         addEventListener: () => {},
@@ -82,13 +88,16 @@ function makeCanvas() {
 
 const stageListeners = new Map();
 
+const stageSize = { width: STAGE_SIZE, height: STAGE_SIZE };
+const resizeObservers = [];
+
 const stageElement = {
     tagName: 'DIV',
     style: {},
-    clientWidth: STAGE_SIZE,
-    clientHeight: STAGE_SIZE,
+    get clientWidth() { return stageSize.width; },
+    get clientHeight() { return stageSize.height; },
     classList: { add: () => {}, remove: () => {}, toggle: () => {} },
-    getBoundingClientRect: () => ({ left: 0, top: 0, width: STAGE_SIZE, height: STAGE_SIZE }),
+    getBoundingClientRect: () => ({ left: 0, top: 0, width: stageSize.width, height: stageSize.height }),
     addEventListener: (type, handler) => {
         if (!stageListeners.has(type)) stageListeners.set(type, []);
         stageListeners.get(type).push(handler);
@@ -483,8 +492,28 @@ function wheel(deltaY, extra = {}) {
 }
 
 function zoomLabel() {
-    const node = byClass('pxs-hex').find((entry) => /^\d+×$/.test(textOf(entry).trim()));
+    const node = byClass('pxs-hex').find((entry) => /^\d+(?:\.\d+)?×$/.test(textOf(entry).trim()));
     return node ? textOf(node).trim() : null;
+}
+
+function artRect() {
+    const canvas = byClass('pxs-canvas')[0];
+    const rects = canvas && canvas.props.ref.current && canvas.props.ref.current.__rects;
+    return rects && rects.length > 0 ? rects[rects.length - 1] : null;
+}
+
+function artCentre() {
+    const rect = artRect();
+    if (!rect) return null;
+    return { x: rect.x + rect.w / 2, y: rect.y + rect.h / 2 };
+}
+
+function resizeStage(width, height) {
+    stageSize.width = width;
+    stageSize.height = height;
+    for (const observer of [...resizeObservers]) {
+        if (typeof observer.callback === 'function') observer.callback([{ target: stageElement }], observer);
+    }
 }
 
 function noticeText() {
@@ -528,8 +557,15 @@ function loadModule() {
         console,
         HTMLElement: class {},
         ResizeObserver: class {
+            constructor(callback) {
+                this.callback = callback;
+                resizeObservers.push(this);
+            }
             observe() {}
-            disconnect() {}
+            disconnect() {
+                const index = resizeObservers.indexOf(this);
+                if (index >= 0) resizeObservers.splice(index, 1);
+            }
         },
         fetch: fetchStub,
         setTimeout: windowStub.setTimeout,
@@ -727,6 +763,132 @@ function loadModule() {
     wheel(-120);
     await pump('plain-wheel');
     check('wheel without a drag still zooms', zoomLabel() !== zoomBefore, `${zoomBefore} → ${zoomLabel()}`);
+
+    /* 11. zooming keeps the artwork centred on the stage -------------------- */
+    key('Escape');
+    await pump('escape-3');
+    fitButton.props.onClick({ preventDefault() {}, stopPropagation() {} });
+    await pump('fit-2');
+    let rect = artRect();
+    check(
+        'fit centres the artwork',
+        rect !== null
+        && Math.abs(rect.x + rect.w / 2 - STAGE_SIZE / 2) <= 1
+        && Math.abs(rect.y + rect.h / 2 - STAGE_SIZE / 2) <= 1,
+        JSON.stringify(rect),
+    );
+
+    const zoomInButton = findAll((node) => node.type === 'button'
+        && typeof node.props.title === 'string'
+        && node.props.title.startsWith('放大'))[0];
+    const zoomOutButton = findAll((node) => node.type === 'button'
+        && typeof node.props.title === 'string'
+        && node.props.title.startsWith('缩小'))[0];
+    check('zoom buttons exist', Boolean(zoomInButton && zoomOutButton));
+
+    if (zoomInButton) zoomInButton.props.onClick({ preventDefault() {}, stopPropagation() {} });
+    await pump('zoom-in');
+    const centreAfterZoomIn = artCentre();
+    check('zoom in grows around the stage centre', zoomLabel() === '24×', zoomLabel());
+    check(
+        'zoom in keeps the artwork centred',
+        centreAfterZoomIn !== null
+        && Math.abs(centreAfterZoomIn.x - STAGE_SIZE / 2) <= 1
+        && Math.abs(centreAfterZoomIn.y - STAGE_SIZE / 2) <= 1,
+        JSON.stringify(centreAfterZoomIn),
+    );
+
+    if (zoomOutButton) zoomOutButton.props.onClick({ preventDefault() {}, stopPropagation() {} });
+    await pump('zoom-out');
+    check('zoom out returns to the previous step', zoomLabel() === '16×', zoomLabel());
+
+    /* 12a. the zoom slider reaches fractional levels ------------------------ */
+    const zoomRange = byClass('pxs-zoom-range')[0];
+    check('the zoom slider exists', Boolean(zoomRange));
+    if (zoomRange) {
+        check('the slider reflects the current zoom', Number(zoomRange.props.value) === 778, String(zoomRange.props.value));
+        zoomRange.props.onChange({ target: { value: 500 } });
+        await pump('zoom-range');
+        check('the slider reaches a fractional zoom', zoomLabel() === '2.8×', zoomLabel());
+        const centreAfterSlider = artCentre();
+        check(
+            'the slider zooms around the stage centre',
+            centreAfterSlider !== null
+            && Math.abs(centreAfterSlider.x - STAGE_SIZE / 2) <= 1
+            && Math.abs(centreAfterSlider.y - STAGE_SIZE / 2) <= 1,
+            JSON.stringify(centreAfterSlider),
+        );
+        const sliderAfter = byClass('pxs-zoom-range')[0];
+        check('the slider follows the applied zoom', Boolean(sliderAfter) && Number(sliderAfter.props.value) === 500, String(sliderAfter && sliderAfter.props.value));
+    }
+
+    /* 12. resizing the window keeps the view anchored, fit stays inside ----- */
+    resizeStage(320, 240);
+    await pump('stage-resize');
+    const centreAfterResize = artCentre();
+    check(
+        'resizing the stage keeps the artwork centred',
+        centreAfterResize !== null
+        && Math.abs(centreAfterResize.x - 160) <= 1
+        && Math.abs(centreAfterResize.y - 120) <= 1,
+        JSON.stringify(centreAfterResize),
+    );
+
+    fitButton.props.onClick({ preventDefault() {}, stopPropagation() {} });
+    await pump('fit-after-resize');
+    rect = artRect();
+    check(
+        'fit after a resize stays inside the stage',
+        rect !== null && rect.x >= 0 && rect.y >= 0
+        && rect.x + rect.w <= 320 && rect.y + rect.h <= 240,
+        JSON.stringify(rect),
+    );
+    check(
+        'fit after a resize is centred',
+        rect !== null
+        && Math.abs(rect.x + rect.w / 2 - 160) <= 1
+        && Math.abs(rect.y + rect.h / 2 - 120) <= 1,
+        JSON.stringify(rect),
+    );
+
+    /* 13. while the zoom is the fitted one, a resize reframes on its own ---- */
+    const refitButton = byText('适应').find((node) => node.type === 'button');
+    if (refitButton) refitButton.props.onClick({ preventDefault() {}, stopPropagation() {} });
+    await pump('fit-before-resize');
+    check('fit after the wide stage lands on 24×', zoomLabel() === '24×', zoomLabel());
+
+    resizeStage(400, 300);
+    await pump('stage-refit');
+    check('resizing at fit zoom reframes the artwork', zoomLabel() === '32×', zoomLabel());
+    const refit = artRect();
+    check(
+        'the reframed artwork is centred in the wider stage',
+        refit !== null
+        && Math.abs(refit.x + refit.w / 2 - 200) <= 1
+        && Math.abs(refit.y + refit.h / 2 - 150) <= 1,
+        JSON.stringify(refit),
+    );
+    check(
+        'the reframed artwork still fits the stage',
+        refit !== null && refit.x >= 0 && refit.y >= 0
+        && refit.x + refit.w <= 400 && refit.y + refit.h <= 300,
+        JSON.stringify(refit),
+    );
+
+    /* 14. auto-fit off: a resize must leave the canvas size alone ---------- */
+    const autoFitOn = byText('自适应开').find((node) => node.type === 'button');
+    check('the toolbar offers an auto-fit toggle', Boolean(autoFitOn));
+    autoFitOn.props.onClick({ preventDefault() {}, stopPropagation() {} });
+    await pump('autofit-off');
+    check('the auto-fit toggle flips to 关', byText('自适应关').length > 0);
+    const steadyScale = zoomLabel();
+    resizeStage(320, 240);
+    await pump('stage-resize-manual');
+    check('with auto-fit off a resize keeps the zoom', zoomLabel() === steadyScale, `${steadyScale} -> ${zoomLabel()}`);
+    const autoFitOff = byText('自适应关').find((node) => node.type === 'button');
+    autoFitOff.props.onClick({ preventDefault() {}, stopPropagation() {} });
+    await pump('autofit-on');
+    check('switching auto-fit back on reframes the artwork', zoomLabel() === '24×', zoomLabel());
 
     console.log(failures === 0 ? 'PASS: selection interactions behave' : `FAIL: ${failures} check(s) failed`);
     process.exit(failures === 0 ? 0 : 1);

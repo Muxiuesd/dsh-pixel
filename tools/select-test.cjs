@@ -171,6 +171,15 @@ function truthy(label, value) {
     console.log(`  FAIL ${label}`);
 }
 
+function near(label, actual, expected, tolerance) {
+    if (Math.abs(actual - expected) <= tolerance) {
+        console.log(`  ok   ${label}`);
+        return;
+    }
+    failures += 1;
+    console.log(`  FAIL ${label}\n       expected ${expected} ±${tolerance}\n       actual   ${actual}`);
+}
+
 const {
     selectionBetween,
     clampRectangle,
@@ -235,6 +244,216 @@ const layers = [
 ];
 same('top-most non-transparent cell wins', mergedRegion(layers, { x: 0, y: 0, w: 4, h: 2 }), ['aabb', '.c..']);
 same('hidden layers never show up', mergedRegion([layers[2]], { x: 0, y: 0, w: 2, h: 1 }), ['..']);
+
+console.log('colour wheel maths');
+
+const color = windowStub.__PXS_TEST__.color;
+if (!color) {
+    console.error('FAIL: window.__PXS_TEST__.color hook is missing');
+    process.exit(1);
+}
+const { rgbToHsv, hsvToRgb, hsvToHex, hexToRgb, complementHsv, wheelGeometry, wheelHitTest } = color;
+
+same('red sits at hue 0', hsvToHex(0, 1, 1), '#ff0000');
+same('green sits at hue 120', hsvToHex(120, 1, 1), '#00ff00');
+same('blue sits at hue 240', hsvToHex(240, 1, 1), '#0000ff');
+same('zero saturation is white', hsvToHex(200, 0, 1), '#ffffff');
+same('zero value is black', hsvToHex(200, 1, 0), '#000000');
+same('hsvToRgb agrees with hsvToHex', hsvToRgb(30, 0.5, 0.8), [204, 153, 102]);
+
+const roundTrip = rgbToHsv(hexToRgb('#3366cc'));
+near('rgbToHsv recovers the hue', roundTrip.h, 220, 1);
+near('rgbToHsv recovers the saturation', roundTrip.s, 0.75, 0.01);
+near('rgbToHsv recovers the value', roundTrip.v, 0.8, 0.01);
+
+const redComplement = complementHsv(0, 1, 1);
+same('complement of red is cyan', hsvToHex(redComplement.h, redComplement.s, redComplement.v), '#00ffff');
+const greenComplement = complementHsv(120, 1, 1);
+same('complement of green is magenta', hsvToHex(greenComplement.h, greenComplement.s, greenComplement.v), '#ff00ff');
+const greyComplement = complementHsv(210, 0, 0.2);
+same('greys keep their hue slot', greyComplement.h, 210);
+near('greys flip their lightness instead', greyComplement.v, 0.8, 0.001);
+
+console.log('colour wheel hit testing');
+
+const geo = wheelGeometry();
+same('wheel size', geo.size, 184);
+same('wheel inner radius', geo.inner, 73);
+same('wheel square side', geo.side, 86);
+same('wheel square left edge', geo.left, 49);
+
+const middleHit = wheelHitTest(geo.centre, geo.centre);
+same('the centre is the saturation square', middleHit.mode, 'sv');
+near('the centre is half saturation', (middleHit.x - geo.left) / geo.side, 0.5, 0.001);
+near('the centre is half value', 1 - (middleHit.y - geo.top) / geo.side, 0.5, 0.001);
+
+const cornerHit = wheelHitTest(geo.left, geo.top);
+same('the square corner stays saturation/value', cornerHit.mode, 'sv');
+near('the top-left corner is zero saturation', (cornerHit.x - geo.left) / geo.side, 0, 0.001);
+near('the top-left corner is full value', 1 - (cornerHit.y - geo.top) / geo.side, 1, 0.001);
+
+const overCornerHit = wheelHitTest(geo.left - 4, geo.top - 4);
+same('pointer just past a corner keeps the square mode', overCornerHit.mode, 'sv');
+near('past the corner clamps to zero saturation', (overCornerHit.x - geo.left) / geo.side, 0, 0.001);
+
+const ringTopHit = wheelHitTest(geo.centre, geo.centre - 82);
+same('the hue ring is reachable above the square', ringTopHit.mode, 'hue');
+near('the ring above is hue -90 degrees', (ringTopHit.angle * 180) / Math.PI, -90, 0.001);
+
+const ringRightHit = wheelHitTest(geo.centre + 84, geo.centre);
+same('the hue ring is reachable right of the square', ringRightHit.mode, 'hue');
+near('the ring on the right is hue 0', ringRightHit.angle, 0, 0.001);
+
+const ringDiagonalHit = wheelHitTest(geo.centre + 60, geo.centre - 60);
+same('the hue ring is reachable on the diagonal', ringDiagonalHit.mode, 'hue');
+
+const gapHit = wheelHitTest(geo.centre, geo.centre - (geo.inner - 6));
+same('the gap just inside the ring still uses the square', gapHit.mode, 'sv');
+near('the gap clamps to full value', 1 - (gapHit.y - geo.top) / geo.side, 1, 0.001);
+
+console.log('palette edits never repaint the canvas');
+
+const paletteApi = windowStub.__PXS_TEST__.palette;
+if (!paletteApi) {
+    console.error('FAIL: window.__PXS_TEST__.palette hook is missing');
+    process.exit(1);
+}
+const { detachSlot, recolourSlot, slotInUse, chars } = paletteApi;
+
+function artDoc(rows, colours) {
+    return {
+        w: rows[0].length,
+        h: rows.length,
+        palette: colours.slice(),
+        layers: [{ name: 'base', visible: true, rows: rows.slice() }],
+    };
+}
+
+/** What the canvas actually shows, cell by cell, as colours instead of chars. */
+function canvasColours(doc) {
+    return doc.layers[0].rows.map((row) => row.split('').map((ch) => {
+        if (ch === '.') return null;
+        const slot = chars.indexOf(ch);
+        const colour = slot >= 0 && slot < doc.palette.length ? doc.palette[slot] : 'missing';
+        return colour.toLowerCase();
+    }));
+}
+
+const pixelDoc = artDoc(['00.', '.00'], ['#ff0000', '#00ff00', '#0000ff']);
+same('a painted slot counts as in use', slotInUse(pixelDoc, 0), true);
+same('an empty slot counts as unused', slotInUse(pixelDoc, 2), false);
+
+const detached = detachSlot(pixelDoc, 0);
+same('detach parks the pixels on the first free slot', detached.target, 1);
+same('the free slot takes over the old colour', detached.doc.palette[1], '#ff0000');
+same('the pixels now point at the new slot', detached.doc.layers[0].rows, ['11.', '.11']);
+same('detach leaves the source document alone', pixelDoc.layers[0].rows, ['00.', '.00']);
+
+const untouched = detachSlot(pixelDoc, 2);
+same('detaching an unused slot is a no-op', untouched.target, -1);
+truthy('an unused slot keeps the document object', untouched.doc === pixelDoc);
+
+const accepted = recolourSlot(pixelDoc, 0, '#123456');
+truthy('recolouring a painted slot is allowed', !accepted.error);
+same('the edited slot takes the new colour', accepted.doc.palette[0], '#123456');
+same('recolouring moves the pixels off the edited slot', accepted.movedTo, 1);
+same('the canvas looks exactly the same afterwards', canvasColours(accepted.doc), canvasColours(pixelDoc));
+truthy('recolouring keeps the palette size', accepted.doc.palette.length === pixelDoc.palette.length);
+
+const again = recolourSlot(accepted.doc, 0, '#abcdef');
+same('a second edit of the same slot needs no move', again.movedTo, -1);
+same('a second edit keeps the canvas identical', canvasColours(again.doc), canvasColours(pixelDoc));
+
+const duplicateDoc = artDoc(['0..'], ['#ff0000', '#00ff00', '#ff0000']);
+const reused = recolourSlot(duplicateDoc, 0, '#000000');
+same('a slot that already holds the colour is preferred', reused.movedTo, 2);
+same('reuse does not grow the palette', reused.doc.palette.length, 3);
+same('reuse leaves the canvas alone', canvasColours(reused.doc), canvasColours(duplicateDoc));
+
+let fullRows = '';
+for (let i = 0; i < chars.length; i += 1) fullRows += chars[i];
+const fullDoc = artDoc([fullRows], Array.from({ length: chars.length }, (_v, i) => `#${(i * 7 % 256).toString(16).padStart(2, '0')}0000`));
+same('a palette with every slot painted is refused', JSON.stringify(recolourSlot(fullDoc, 0, '#123456')), JSON.stringify({ error: 'full' }));
+same('the refused edit leaves the document untouched', fullDoc.palette[0], '#000000');
+same('recolouring the same colour is a no-op', recolourSlot(pixelDoc, 0, '#ff0000').error, 'same');
+same('bad hex is rejected', recolourSlot(pixelDoc, 0, 'red').error, 'colour');
+same('out-of-range slots are rejected', recolourSlot(pixelDoc, 9, '#123456').error, 'index');
+
+console.log('shell width handle sweep');
+
+const handlesApi = windowStub.__PXS_TEST__.handles;
+if (!handlesApi) {
+    console.error('FAIL: window.__PXS_TEST__.handles hook is missing');
+    process.exit(1);
+}
+const { hideShellHandles, restoreShellHandles, selector } = handlesApi;
+
+same('the sweep matches the width handle hooks', selector, '[data-width-handle], [class*="widthHandle"]');
+
+const makeNode = (className, display) => ({ style: { display }, className });
+const leftHandle = makeNode('an3WzG_widthHandle', '');
+const rightHandle = makeNode('an3WzG_widthHandle', '');
+const splitters = [makeNode('pxs-splitter', ''), makeNode('pxs-splitter', '')];
+const studioRoot = { contains: (element) => splitters.indexOf(element) >= 0 };
+const shellBody = {
+    querySelectorAll: (query) => (query === selector ? [leftHandle, rightHandle, ...splitters] : []),
+};
+const hiddenNodes = new Map();
+same('both shell handles are hidden', hideShellHandles(studioRoot, shellBody, hiddenNodes, null), 2);
+same('the left handle is display:none', leftHandle.style.display, 'none');
+same('the right handle is display:none', rightHandle.style.display, 'none');
+same('studio splitters are never touched', splitters[1].style.display, '');
+same('every hidden node is recorded once', hiddenNodes.size, 2);
+restoreShellHandles(hiddenNodes);
+same('restoring brings the handles back', [leftHandle.style.display, rightHandle.style.display], ['', '']);
+same('restoring clears the bookkeeping', hiddenNodes.size, 0);
+
+// Fallback: nothing carries the hashed class, so the sweep inspects computed
+// styles and only picks absolutely positioned col-resize strips.
+const plainNode = makeNode('chat-column', '');
+const mysteryNode = makeNode('mystery-box', '');
+const fallbackBody = {
+    querySelectorAll: (query) => (query === selector ? [] : [plainNode, mysteryNode]),
+};
+const fallbackHidden = new Map();
+const computedStyle = (element) => (element === mysteryNode
+    ? { cursor: 'col-resize', position: 'absolute' }
+    : { cursor: 'auto', position: 'static' });
+same('the computed-style fallback finds the handle', hideShellHandles(null, fallbackBody, fallbackHidden, computedStyle), 1);
+same('the fallback hides the strip', mysteryNode.style.display, 'none');
+
+const staticStrip = makeNode('static-strip', '');
+const staticBody = { querySelectorAll: (query) => (query === selector ? [] : [staticStrip]) };
+same('a statically placed col-resize strip is ignored',
+    hideShellHandles(null, staticBody, new Map(), () => ({ cursor: 'col-resize', position: 'static' })), 0);
+same('the ignored strip keeps its display', staticStrip.style.display, '');
+
+const bareBody = { appendChild() {}, removeChild() {} };
+same('a document without querySelectorAll is tolerated', hideShellHandles(null, bareBody, new Map(), null), 0);
+
+console.log('shell composer sweep');
+
+const { hideShellComposer, composerSelector } = handlesApi;
+same('the composer sweep matches the seat hooks', composerSelector,
+    '[data-composer-seat], [data-conversation-region="composer"]');
+
+const seat = makeNode('an3WzG_composerSeat', 'flex');
+const studioInner = makeNode('pxs-root', 'flex');
+const composerBody = {
+    querySelectorAll: (query) => (query === composerSelector ? [seat, studioInner] : []),
+};
+const hiddenSeats = new Map();
+const composerRoot = { contains: (element) => element === studioInner };
+same('the composer seat is hidden', hideShellComposer(composerRoot, composerBody, hiddenSeats), 1);
+same('the seat loses its display', seat.style.display, 'none');
+same('the studio root is never hidden by the composer sweep', studioInner.style.display, 'flex');
+same('the original display is remembered', hiddenSeats.get(seat), 'flex');
+same('a second sweep is a no-op', hideShellComposer(composerRoot, composerBody, hiddenSeats), 0);
+restoreShellHandles(hiddenSeats);
+same('restoring the composer brings back its display', seat.style.display, 'flex');
+same('the composer bookkeeping is cleared', hiddenSeats.size, 0);
+same('a document without querySelectorAll is tolerated by the composer sweep',
+    hideShellComposer(null, bareBody, new Map()), 0);
 
 if (failures > 0) {
     console.error(`FAIL: ${failures} selection assertion(s) failed`);

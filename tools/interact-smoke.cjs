@@ -42,6 +42,8 @@ const canvasContext = {
     set fillStyle(_value) {},
 };
 
+const windowListeners = new Map();
+
 const windowStub = {
     devicePixelRatio: 2,
     innerWidth: 1440,
@@ -61,8 +63,16 @@ const windowStub = {
         return 1;
     },
     clearTimeout: () => {},
-    addEventListener: () => {},
-    removeEventListener: () => {},
+    addEventListener: (type, fn) => {
+        if (!windowListeners.has(type)) windowListeners.set(type, []);
+        windowListeners.get(type).push(fn);
+    },
+    removeEventListener: (type, fn) => {
+        const list = windowListeners.get(type);
+        if (!list) return;
+        const index = list.indexOf(fn);
+        if (index >= 0) list.splice(index, 1);
+    },
     matchMedia: () => ({ matches: false, addEventListener: () => {}, removeEventListener: () => {} }),
     location: { reload: () => {} },
     confirm: () => false,
@@ -103,6 +113,21 @@ function summarize(doc) {
         layers: doc.layers.length,
         savedAt: 1,
     };
+}
+
+const PALETTE_CHARS = '0123456789abcdefghijklmnopqrstuvwxyz';
+
+/** What the canvas really shows, per visible layer and cell, as colours. */
+function canvasColours(doc) {
+    return doc.layers.map((layer) => {
+        if (layer.visible === false) return null;
+        return layer.rows.map((row) => row.split('').map((ch) => {
+            if (ch === '.') return null;
+            const slot = PALETTE_CHARS.indexOf(ch);
+            if (slot < 0 || slot >= doc.palette.length) return 'missing';
+            return String(doc.palette[slot]).toLowerCase();
+        }));
+    });
 }
 
 function makeDoc(input) {
@@ -399,6 +424,19 @@ function event(extra = {}) {
     return base;
 }
 
+/** Fire a keydown at the window-level handler the editor installs. */
+function fireKey(key, extra = {}) {
+    const handlers = (windowListeners.get('keydown') || []).slice();
+    if (handlers.length === 0) throw new Error('the editor never registered a keydown handler');
+    for (const handler of handlers) {
+        handler(event({
+            key,
+            target: { tagName: 'BODY', isContentEditable: false },
+            ...extra,
+        }));
+    }
+}
+
 /* -------------------------------------------------------------------------- */
 /* run                                                                        */
 /* -------------------------------------------------------------------------- */
@@ -534,34 +572,119 @@ function loadModule() {
     check('document starts with the 8-colour PICO-8 palette', created && created.palette.length === 8, created && created.palette.length);
 
     const sw = byClass('pxs-swatches')[0];
-    // 5. open the colour editor on the first swatch
+    // 5. paint the whole canvas so the palette edit has pixels to protect
+    fireKey('a', { ctrlKey: true });
+    await pump('select-all');
+    const selectionLabel = byClass('pxs-selection-label')[0];
+    check('select all marks the whole canvas', Boolean(selectionLabel), selectionLabel && textOf(selectionLabel));
+    const fillButton = byText('▣ 填充', 'button')[0];
+    check('the selection bar offers a fill button', Boolean(fillButton));
+    fillButton.props.onClick(event());
+    await pump('fill-selection');
+    check('the fill painted the whole layer', created.layers[0].rows.join('') === '0'.repeat(16 * 16), created.layers[0].rows[0]);
+
+    // 6. open the colour editor on the first swatch
     const swatch = byClass('pxs-swatch')[0];
     check('first palette swatch is rendered', Boolean(swatch));
     swatch.props.onDoubleClick(event());
     await pump('open-editor');
     check('colour editor panel is mounted', byClass('pxs-color-edit').length === 1);
     check('colour editor shows a native colour input', byClass('pxs-native-color').length === 1);
+    check('colour editor offers the hue wheel', findAll((node) => typeof node.type === 'function'
+        && node.type.name === 'ColorWheel').length === 1);
 
-    // 6. recolour the slot; the artwork rows must not change
-    const rowsBefore = created.layers.map((layer) => layer.rows.join('')).join('|');
+    // 7. colour edits are a draft: nothing lands in the palette before 「完成」
+    const coloursBefore = canvasColours(created);
     const hexInput = findAll((node) => node.type === 'input'
         && typeof node.props.className === 'string'
         && node.props.className.includes('pxs-hex-input'))[0];
     check('hex input exists', Boolean(hexInput));
     hexInput.props.onBlur(event({ currentTarget: { value: '#123456' } }));
-    await pump('recolour-slot');
-    check('palette slot 0 took the new colour', created.palette[0] === '#123456', created.palette[0]);
-    const rowsAfter = created.layers.map((layer) => layer.rows.join('')).join('|');
-    check('artwork rows are untouched by the recolour', rowsBefore === rowsAfter);
+    await pump('draft-colour');
+    check('a draft edit leaves the palette untouched', created.palette[0] !== '#123456', created.palette[0]);
+    check('the draft is not saved to disk by itself', created.palette[0] !== '#123456', created.palette[0]);
+    const compareChips = byClass('pxs-compare-chip');
+    check('colour editor compares old and new colour', compareChips.length === 2, String(compareChips.length));
+    check('compare strip keeps the untouched colour on the left',
+        compareChips[0].props.style.background === created.palette[0], compareChips[0].props.style.background);
+    check('compare strip shows the draft colour on the right',
+        compareChips[1].props.style.background === '#123456', compareChips[1].props.style.background);
 
-    // 7. unsaved-pixel safety: a second recolour must not add palette slots on an empty canvas
-    const paletteSize = created.palette.length;
+    const finish = byText('完成', 'button')[0];
+    check('colour editor offers a 完成 button', Boolean(finish));
+    finish.props.onClick();
+    await pump('commit-colour');
+    check('「完成」 writes the colour into the slot', created.palette[0] === '#123456', created.palette[0]);
+    check('the filled canvas still points at a slot', created.layers[0].rows[0][0] !== '.', created.layers[0].rows[0]);
+    check('the recolour never repaints the canvas', JSON.stringify(canvasColours(created)) === JSON.stringify(coloursBefore),
+        JSON.stringify(canvasColours(created)[0][0]));
+    check('the editor closes after committing', byClass('pxs-color-edit').length === 0);
+
+    // 8. switching swatches with an unfinished edit must discard it
+    const swatchAgain = byClass('pxs-swatch')[0];
+    check('palette swatches are clickable', Boolean(swatchAgain && swatchAgain.props.onDoubleClick));
+    swatchAgain.props.onDoubleClick();
+    await pump('reopen-editor');
     const hexInput2 = findAll((node) => node.type === 'input'
         && typeof node.props.className === 'string'
         && node.props.className.includes('pxs-hex-input'))[0];
     hexInput2.props.onBlur(event({ currentTarget: { value: '#654321' } }));
-    await pump('recolour-again');
-    check('palette keeps its size on an untouched canvas', created.palette.length === paletteSize, `${created.palette.length} vs ${paletteSize}`);
+    await pump('draft-colour-2');
+    check('second draft also stays out of the palette', created.palette[0] === '#123456', created.palette[0]);
+    const cancel = byText('取消', 'button')[0];
+    check('colour editor offers 取消', Boolean(cancel));
+    cancel.props.onClick();
+    await pump('cancel-colour');
+    check('取消 throws the draft away', created.palette[0] === '#123456', created.palette[0]);
+    check('cancelling keeps the picture identical', JSON.stringify(canvasColours(created)) === JSON.stringify(coloursBefore));
+
+    // 9. an unfinished edit is dropped when the user double-clicks another swatch
+    const swatches = byClass('pxs-swatch');
+    check('palette has at least two swatches', swatches.length >= 2, String(swatches.length));
+    swatches[0].props.onDoubleClick();
+    await pump('reopen-editor-2');
+    const hexInput3 = findAll((node) => node.type === 'input'
+        && typeof node.props.className === 'string'
+        && node.props.className.includes('pxs-hex-input'))[0];
+    hexInput3.props.onBlur(event({ currentTarget: { value: '#0f0f0f' } }));
+    await pump('draft-colour-3');
+    swatches[1].props.onDoubleClick();
+    await pump('switch-swatch');
+    check('switching swatches drops the previous draft', created.palette[0] === '#123456', created.palette[0]);
+    check('switching swatches did not write slot 1', created.palette[1] === '#0f0f0f' ? 'wrote' : created.palette[1],
+        'slot 1 must keep its colour');
+    check('the editor now shows the newly picked slot', byClass('pxs-color-edit').length === 1);
+
+    // 10. the studio must strip the shell's conversation-width handle while open
+    const clientSource = fs.readFileSync(CLIENT, 'utf8');
+    check('studio sweeps the shell width handle', clientSource.includes('hideShellHandles(studioRoot, studioBody'));
+    check('width handles are handed back on unmount', clientSource.includes('restoreShellHandles(hiddenHandles)'));
+    check('the sweep skips its own splitter nodes', clientSource.includes('root.contains(element)'));
+    check('studio hides the shell composer seat', clientSource.includes('hideShellComposer(studioRoot, studioBody'));
+
+    // 11. composer + auto-fit toggles in the toolbar
+    const hideToggle = byText('对话框隐藏', 'button')[0];
+    check('toolbar offers a composer toggle', Boolean(hideToggle));
+    hideToggle.props.onClick();
+    await pump('toggle-composer');
+    check('the composer toggle flips to 显示', byText('对话框显示', 'button').length === 1);
+    check('the composer preference is remembered', storage.get('pxs:hideComposer') === '0', String(storage.get('pxs:hideComposer')));
+    const fitToggle = byText('自适应开', 'button')[0];
+    check('toolbar offers an auto-fit toggle', Boolean(fitToggle));
+    fitToggle.props.onClick();
+    await pump('toggle-autofit');
+    check('the auto-fit toggle flips to 关', byText('自适应关', 'button').length === 1);
+
+    // 12. the auto-fit toggle sits right after the fit button, notice is centred
+    const fitIndex = clientSource.indexOf("onClick: fitToView }, '适应'),");
+    const autoFitIndex = clientSource.indexOf("'data-active': autoFit,");
+    const gridIndex = clientSource.indexOf("'data-active': showGrid,");
+    check('the auto-fit button follows the fit button', fitIndex > 0 && autoFitIndex > fitIndex && autoFitIndex < gridIndex,
+        `${fitIndex} / ${autoFitIndex} / ${gridIndex}`);
+    check('only one auto-fit button exists', clientSource.indexOf("'data-active': autoFit,") === clientSource.lastIndexOf("'data-active': autoFit,"));
+    check('the notice lives in a centred bar cluster', clientSource.includes("className: 'pxs-bar-center'")
+        && clientSource.includes('.pxs-bar-center {'));
+    check('the auto-fit preference is remembered', storage.get('pxs:autoFit') === '0', String(storage.get('pxs:autoFit')));
 
     console.log(failures === 0 ? 'PASS: interaction flow works end to end' : `FAIL: ${failures} check(s) failed`);
     process.exit(failures === 0 ? 0 : 1);

@@ -13,7 +13,35 @@ window.__ModuleLoader__.load({
         const { useState, useEffect, useRef, useCallback } = React;
 
         const API = '/dsh-pixel-studio';
-        const ZOOMS = [1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64];
+        const ZOOMS = [0.125, 0.25, 0.5, 0.75, 1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64];
+        const MIN_ZOOM = ZOOMS[0];
+        const MAX_ZOOM = ZOOMS[ZOOMS.length - 1];
+        /** The slider travels a log scale: equal drags feel equal at 0.2× and 20×. */
+        const ZOOM_SLIDER_STEPS = 1000;
+
+        function clampZoom(value) {
+            const number = Number(value);
+            if (!Number.isFinite(number) || number <= 0) return 1;
+            return Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, number));
+        }
+
+        function zoomToSlider(value) {
+            const ratio = Math.log(clampZoom(value) / MIN_ZOOM) / Math.log(MAX_ZOOM / MIN_ZOOM);
+            return Math.round(ratio * ZOOM_SLIDER_STEPS);
+        }
+
+        function sliderToZoom(position) {
+            const raw = Number(position);
+            const ratio = Math.min(1, Math.max(0, Number.isFinite(raw) ? raw : 0) / ZOOM_SLIDER_STEPS);
+            return clampZoom(MIN_ZOOM * Math.pow(MAX_ZOOM / MIN_ZOOM, ratio));
+        }
+
+        /** 16 -> "16", 1.5 -> "1.5", 0.375 -> "0.375". */
+        function formatZoom(value) {
+            const zoomValue = clampZoom(value);
+            const decimals = zoomValue >= 10 ? 0 : zoomValue >= 1 ? 1 : 3;
+            return String(Number(zoomValue.toFixed(decimals)));
+        }
         const CHARS = '0123456789abcdefghijklmnopqrstuvwxyz';
         const HISTORY_LIMIT = 60;
         const MAX_LAYERS = 8;
@@ -270,14 +298,26 @@ window.__ModuleLoader__.load({
 
         /**
          * Palette editing must never repaint the artwork. Before a slot's colour
-         * changes we move the pixels that already use it onto a different slot
-         * that takes over the old colour, so the canvas stays pixel-identical and
-         * the edited slot is free to become the next drawing colour.
+         * changes we move the pixels that already use it onto another slot that
+         * takes over the old colour, so the canvas stays pixel-identical and the
+         * edited slot is free to become the next drawing colour.
+         *
+         * Order of preference: an existing slot with the same colour (nothing to
+         * allocate at all), then a slot no layer references, then a new slot while
+         * the palette still has room. Only a palette with every slot referenced can
+         * fail, and then the caller refuses the edit instead of recolouring pixels.
          */
         function detachSlot(doc, index) {
             const oldColor = doc.palette[index];
             if (oldColor === undefined) return { doc, target: -1, created: false };
             if (!slotInUse(doc, index)) return { doc, target: -1, created: false };
+            const same = oldColor.toLowerCase();
+            for (let slot = 0; slot < doc.palette.length; slot += 1) {
+                if (slot === index) continue;
+                if (String(doc.palette[slot]).toLowerCase() === same) {
+                    return { doc: { ...doc, layers: remapSlot(doc.layers, index, slot) }, target: slot, created: false };
+                }
+            }
             let target = -1;
             for (let slot = 0; slot < doc.palette.length; slot += 1) {
                 if (slot === index) continue;
@@ -286,18 +326,40 @@ window.__ModuleLoader__.load({
                     break;
                 }
             }
-            let palette = doc.palette.slice();
+            const palette = doc.palette.slice();
             let created = false;
             if (target === -1) {
                 if (palette.length >= CHARS.length) return null;
-                palette = palette.concat(oldColor);
+                palette.push(oldColor);
                 target = palette.length - 1;
                 created = true;
-            } else if (palette[target].toLowerCase() !== oldColor.toLowerCase()) {
+            } else {
                 palette[target] = oldColor;
             }
-            const layers = remapSlot(doc.layers, index, target);
-            return { doc: { ...doc, palette, layers }, target, created };
+            return { doc: { ...doc, palette, layers: remapSlot(doc.layers, index, target) }, target, created };
+        }
+
+        /**
+         * The single entry point for "change what colour a palette slot means".
+         * Guarantees that the merged artwork looks exactly the same afterwards:
+         * every pixel that used the slot is repointed before the colour changes.
+         * Returns `{ error }` when nothing may change, never a half-applied edit.
+         */
+        function recolourSlot(doc, index, color) {
+            if (!doc || !Array.isArray(doc.palette)) return { error: 'document' };
+            if (typeof index !== 'number' || index < 0 || index >= doc.palette.length) return { error: 'index' };
+            const nextColor = String(color || '').toLowerCase();
+            if (!/^#[0-9a-f]{6}$/.test(nextColor)) return { error: 'colour' };
+            if (String(doc.palette[index]).toLowerCase() === nextColor) return { error: 'same' };
+            const detached = detachSlot(doc, index);
+            if (!detached) return { error: 'full' };
+            const palette = detached.doc.palette.slice();
+            palette[index] = nextColor;
+            return {
+                doc: { ...detached.doc, palette },
+                movedTo: detached.target,
+                created: detached.created,
+            };
         }
 
         function clamp(value, min, max) {
@@ -577,6 +639,72 @@ window.__ModuleLoader__.load({
         /* ------------------------------------------------------------------ */
         /* image import                                                       */
         /* ------------------------------------------------------------------ */
+
+        /* ------------------------------------------------------------------ */
+        /* shell decoration                                                   */
+        /* ------------------------------------------------------------------ */
+
+        // The conversation shell overlays a draggable width handle on both edges
+        // of every view to resize the chat column. Over a full-bleed editor it is
+        // pure clutter, so the studio hides it while mounted and restores it on
+        // unmount. Kept as plain DOM helpers so the sweep is unit testable.
+        const SHELL_HANDLE_SELECTOR = '[data-width-handle], [class*="widthHandle"]';
+
+        function hideShellHandles(root, body, hidden, computed) {
+            if (!body || typeof body.querySelectorAll !== 'function') return 0;
+            const hide = (element) => {
+                if (!element || !element.style) return;
+                if (root && typeof root.contains === 'function' && root.contains(element)) return;
+                if (hidden.has(element)) return;
+                hidden.set(element, typeof element.style.display === 'string' ? element.style.display : '');
+                element.style.display = 'none';
+            };
+            // CSS Modules keep the local name, so the hashed class still ends with
+            // _widthHandle and this survives host rebuilds.
+            const handles = body.querySelectorAll(SHELL_HANDLE_SELECTOR);
+            if (handles && handles.length > 0) {
+                const before = hidden.size;
+                for (const element of handles) hide(element);
+                return hidden.size - before;
+            }
+            if (typeof computed !== 'function') return 0;
+            let matched = 0;
+            for (const element of body.querySelectorAll('*')) {
+                const style = computed(element);
+                if (!style) continue;
+                if (style.cursor === 'col-resize' && style.position === 'absolute') {
+                    matched += 1;
+                    hide(element);
+                }
+            }
+            return matched;
+        }
+
+        // The bottom composer is the chat input; a full-bleed editor has no use
+        // for it, so the studio can hide it (and hand it back on request).
+        const SHELL_COMPOSER_SELECTOR = '[data-composer-seat], [data-conversation-region="composer"]';
+
+        function hideShellComposer(root, body, hidden) {
+            if (!body || typeof body.querySelectorAll !== 'function') return 0;
+            const before = hidden.size;
+            for (const element of body.querySelectorAll(SHELL_COMPOSER_SELECTOR)) {
+                if (!element || !element.style) continue;
+                if (root && typeof root.contains === 'function' && root.contains(element)) continue;
+                if (hidden.has(element)) continue;
+                hidden.set(element, typeof element.style.display === 'string' ? element.style.display : '');
+                element.style.display = 'none';
+            }
+            return hidden.size - before;
+        }
+
+        /** Hand every remembered node back its original inline display. */
+        function restoreShellHandles(hidden) {
+            for (const [element, display] of hidden) {
+                if (!element || !element.style) continue;
+                element.style.display = display;
+            }
+            hidden.clear();
+        }
 
         /** Largest integer magnification whose PNG stays under the host's pixel cap. */
         function maxScaleFor(width, height) {
@@ -903,26 +1031,47 @@ window.__ModuleLoader__.load({
 
         const CSS = `
 .pxs-root {
-  height: 100%; min-height: 520px; display: flex; flex-direction: column;
+  /* Never advertise a minimum window height: a taller-than-viewport root is what
+     pushes a scrollbar onto the whole page when the window shrinks. */
+  height: var(--pxs-root-height, 100%); max-height: var(--pxs-root-height, 100%);
+  min-height: 0; display: flex; flex-direction: column;
   background: var(--dsw-alias-bg-base, #16181d); color: var(--dsw-alias-label-primary, #e8e8ea);
   font-size: 12px; line-height: 1.45; position: relative; overflow: hidden;
 }
 .pxs-bar {
   flex: 0 0 auto; height: 40px; display: flex; align-items: center; gap: 6px; padding: 0 8px;
+  position: relative;
+  overflow: hidden; white-space: nowrap;
   border-bottom: 1px solid var(--dsw-alias-border-l1, rgba(255,255,255,.1));
   background: var(--dsw-alias-bg-layer-1, #1c1f26);
 }
+.pxs-bar-center {
+  position: absolute; left: 50%; top: 0; bottom: 0; transform: translateX(-50%);
+  display: flex; align-items: center; justify-content: center; gap: 10px;
+  max-width: 46%; min-width: 0; overflow: hidden; pointer-events: none;
+}
+.pxs-bar-center .pxs-notice { max-width: 100%; pointer-events: auto; }
 .pxs-main {
-  flex: 1 1 auto; min-height: 0; display: grid;
+  flex: 1 1 auto; min-height: 0; display: grid; overflow: hidden;
   grid-template-columns:
     var(--pxs-left, 196px) 5px minmax(0, 1fr) 5px var(--pxs-right, 216px);
 }
 .pxs-panel {
   min-height: 0; overflow-y: auto; padding: 10px; position: relative;
+  /* Both side panels scroll with the wheel but never show a bar: a permanent
+     scrollbar in a 216px column looks like a layout bug. */
+  scrollbar-width: none; -ms-overflow-style: none;
   background: var(--dsw-alias-bg-layer-1, #1c1f26);
 }
+.pxs-panel::-webkit-scrollbar { width: 0; height: 0; }
 .pxs-panel-left { border-right: 1px solid var(--dsw-alias-border-l1, rgba(255,255,255,.1)); }
-.pxs-panel-right { border-left: 1px solid var(--dsw-alias-border-l1, rgba(255,255,255,.1)); }
+.pxs-panel-right {
+  border-left: 1px solid var(--dsw-alias-border-l1, rgba(255,255,255,.1));
+  padding: 8px;
+  overflow-y: auto; overflow-x: hidden; overscroll-behavior: contain;
+}
+.pxs-panel-right .pxs-section { margin-bottom: 10px; }
+.pxs-panel-right .pxs-swatch, .pxs-panel-right .pxs-swatch-add { min-width: 0; }
 .pxs-splitter {
   position: relative; z-index: 4; cursor: col-resize; background: transparent; touch-action: none;
 }
@@ -988,15 +1137,15 @@ window.__ModuleLoader__.load({
 }
 .pxs-input:focus { outline: 1px solid var(--dsw-alias-brand-primary, #4c8dff); outline-offset: 0; }
 .pxs-spacer { flex: 1 1 auto; }
-.pxs-swatches { display: grid; grid-template-columns: repeat(8, 1fr); gap: 3px; }
+.pxs-swatches { display: grid; grid-template-columns: repeat(auto-fill, minmax(35px, 1fr)); gap: 4px; }
 .pxs-swatch {
-  aspect-ratio: 1; border-radius: 4px; cursor: pointer; padding: 0; border: 1px solid rgba(0,0,0,.35);
+  aspect-ratio: 1; border-radius: 5px; cursor: pointer; padding: 0; border: 1px solid rgba(0,0,0,.35);
   position: relative;
 }
 .pxs-swatch[data-selected="true"] { box-shadow: 0 0 0 2px var(--dsw-alias-brand-primary, #4c8dff); z-index: 1; }
 .pxs-swatch-add {
-  aspect-ratio: 1; border-radius: 4px; cursor: pointer; border: 1px dashed var(--dsw-alias-border-l2, rgba(255,255,255,.3));
-  background: transparent; color: var(--dsw-alias-label-secondary, #9aa1ad); font-size: 14px; line-height: 1;
+  aspect-ratio: 1; border-radius: 5px; cursor: pointer; border: 1px dashed var(--dsw-alias-border-l2, rgba(255,255,255,.3));
+  background: transparent; color: var(--dsw-alias-label-secondary, #9aa1ad); font-size: 18px; line-height: 1;
 }
 .pxs-primary { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
 .pxs-chip { width: 34px; height: 34px; border-radius: 8px; border: 1px solid rgba(0,0,0,.4); flex: 0 0 auto; }
@@ -1008,6 +1157,21 @@ window.__ModuleLoader__.load({
 }
 .pxs-color-edit-head { display: flex; align-items: center; gap: 6px; }
 .pxs-color-edit-head .pxs-chip { width: 26px; height: 26px; border-radius: 6px; }
+.pxs-color-compare { display: flex; align-items: stretch; gap: 6px; }
+.pxs-compare-cell { flex: 1 1 0; min-width: 0; display: flex; align-items: center; gap: 6px; }
+.pxs-compare-chip {
+  width: 42px; height: 42px; flex: 0 0 auto; border-radius: 7px;
+  border: 1px solid rgba(0,0,0,.45);
+  box-shadow: inset 0 0 0 1px rgba(255,255,255,.07);
+}
+.pxs-compare-after { border-color: var(--dsw-alias-brand-primary, #4c8dff); }
+.pxs-compare-label { display: grid; gap: 1px; min-width: 0; }
+.pxs-compare-key { font-size: 11px; color: var(--dsw-alias-label-secondary, #9aa1ad); }
+.pxs-compare-hex {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px;
+  color: var(--dsw-alias-label-primary, #e8ebf0);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
 .pxs-hex-input {
   flex: 1 1 auto; min-width: 0; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   font-size: 11px; text-transform: uppercase;
@@ -1020,6 +1184,12 @@ window.__ModuleLoader__.load({
   color: var(--dsw-alias-label-secondary, #9aa1ad);
 }
 .pxs-range { width: 100%; height: 14px; margin: 0; accent-color: var(--dsw-alias-brand-primary, #4c8dff); }
+.pxs-zoom-range {
+  width: 104px; height: 14px; margin: 0 2px; cursor: pointer;
+  accent-color: var(--dsw-alias-brand-primary, #4c8dff);
+}
+.pxs-zoom-range:disabled { opacity: .45; cursor: default; }
+.pxs-zoom-label { min-width: 44px; text-align: center; }
 .pxs-meta { display: grid; grid-template-columns: auto 1fr; gap: 2px 8px; font-size: 11px; color: var(--dsw-alias-label-secondary, #9aa1ad); }
 .pxs-meta b { color: var(--dsw-alias-label-primary, #e8e8ea); font-weight: 500; }
 .pxs-keys { font-size: 10.5px; color: var(--dsw-alias-label-secondary, #9aa1ad); display: grid; gap: 2px; }
@@ -1132,6 +1302,11 @@ window.__ModuleLoader__.load({
 .pxs-native-color::-webkit-color-swatch-wrapper { padding: 2px; }
 .pxs-native-color::-webkit-color-swatch { border: 0; border-radius: 4px; }
 .pxs-native-color::-moz-color-swatch { border: 0; border-radius: 4px; }
+.pxs-wheel-wrap { display: flex; flex-direction: column; align-items: center; gap: 6px; }
+.pxs-wheel { width: 184px; height: auto; max-width: 100%; display: block; cursor: crosshair; touch-action: none; }
+.pxs-wheel-actions { display: flex; gap: 6px; }
+.pxs-wheel-actions .pxs-btn { height: 24px; padding: 0 10px; font-size: 11px; }
+.pxs-wheel-hint { text-align: center; }
 .pxs-picker-btn { width: 100%; }
 .pxs-hint { color: var(--dsw-alias-label-secondary, #9aa3b2); line-height: 1.5; margin: 0; }
 .pxs-new-dialog { width: min(420px, calc(100vw - 40px)); }
@@ -1204,17 +1379,305 @@ window.__ModuleLoader__.load({
 }
 @media (max-width: 900px) {
   .pxs-main { grid-template-columns: 168px 5px minmax(0, 1fr) 5px 176px; }
+  .pxs-zoom-range { width: 72px; }
 }
 @media (max-width: 700px) {
   .pxs-main { grid-template-columns: 56px 5px minmax(0, 1fr) 5px 132px; }
   .pxs-panel { padding: 6px; }
   .pxs-hide-narrow { display: none; }
+  .pxs-zoom-range { display: none; }
 }
 `;
 
         /* ------------------------------------------------------------------ */
         /* editor                                                             */
         /* ------------------------------------------------------------------ */
+
+        /* ------------------------------------------------------------------ */
+        /* colour wheel                                                       */
+        /* ------------------------------------------------------------------ */
+
+        function rgbToHsv(rgb) {
+            const r = rgb[0] / 255;
+            const g = rgb[1] / 255;
+            const b = rgb[2] / 255;
+            const max = Math.max(r, g, b);
+            const min = Math.min(r, g, b);
+            const delta = max - min;
+            let hue = 0;
+            if (delta > 0) {
+                if (max === r) hue = ((g - b) / delta) % 6;
+                else if (max === g) hue = (b - r) / delta + 2;
+                else hue = (r - g) / delta + 4;
+                hue *= 60;
+                if (hue < 0) hue += 360;
+            }
+            return { h: hue, s: max === 0 ? 0 : delta / max, v: max };
+        }
+
+        function hsvToRgb(hue, saturation, value) {
+            const h = ((hue % 360) + 360) % 360;
+            const s = clamp(saturation, 0, 1);
+            const v = clamp(value, 0, 1);
+            const c = v * s;
+            const x = c * (1 - Math.abs(((h / 60) % 2) - 1));
+            const m = v - c;
+            let rgb;
+            if (h < 60) rgb = [c, x, 0];
+            else if (h < 120) rgb = [x, c, 0];
+            else if (h < 180) rgb = [0, c, x];
+            else if (h < 240) rgb = [0, x, c];
+            else if (h < 300) rgb = [x, 0, c];
+            else rgb = [c, 0, x];
+            return rgb.map((unit) => Math.round((unit + m) * 255));
+        }
+
+        function hsvToHex(hue, saturation, value) {
+            return `#${hsvToRgb(hue, saturation, value)
+                .map((part) => clampByte(part).toString(16).padStart(2, '0')).join('')}`;
+        }
+
+        /**
+         * Complementary colour: hue turned half a circle. Grey has no hue to flip,
+         * so its lightness is inverted instead to keep the button useful.
+         */
+        function complementHsv(hue, saturation, value) {
+            if (saturation <= 0.02) return { h: hue, s: saturation, v: clamp(1 - value, 0, 1) };
+            return { h: (hue + 180) % 360, s: saturation, v: value };
+        }
+
+        const WHEEL_PIXELS = 184;
+        const WHEEL_BAND = 18;
+        // Breathing room between the hue ring and the saturation square so the
+        // two controls never look like one blob.
+        const WHEEL_GAP = 12;
+
+        /**
+         * Geometry of the wheel, shared by the painter and the hit test so the two
+         * can never disagree about where the ring ends.
+         */
+        function wheelGeometry() {
+            const size = WHEEL_PIXELS;
+            const centre = size / 2;
+            const outer = centre - 1;
+            const inner = Math.max(6, outer - WHEEL_BAND);
+            const side = Math.max(10, Math.floor((inner - WHEEL_GAP) * Math.SQRT2));
+            return { size, centre, outer, inner, side, left: centre - side / 2, top: centre - side / 2 };
+        }
+
+        /**
+         * Classifies a pointer position inside the wheel canvas: the hue ring wins
+         * as soon as the radius reaches its inner edge, everything inside falls back
+         * to the square (clamped) so the corners still reach pure colours.
+         */
+        function wheelHitTest(x, y) {
+            const geo = wheelGeometry();
+            const dx = x - geo.centre;
+            const dy = y - geo.centre;
+            const radius = Math.hypot(dx, dy);
+            if (radius >= geo.inner - 2) return { mode: 'hue', angle: Math.atan2(dy, dx), geo };
+            return {
+                mode: 'sv',
+                x: clamp(x, geo.left, geo.left + geo.side),
+                y: clamp(y, geo.top, geo.top + geo.side),
+                geo,
+            };
+        }
+
+        /**
+         * Hue ring with a saturation/value square inside it. Dragging the ring
+         * chooses the hue, dragging the square chooses how light/dark the colour
+         * is; every change is reported as a #rrggbb string.
+         */
+        function ColorWheel(props) {
+            const canvasRef = useRef(null);
+            const modelRef = useRef(null);
+            const dragRef = useRef(null);
+            const emittedRef = useRef('');
+            const color = typeof props.color === 'string' ? props.color : '#000000';
+            const onChange = typeof props.onChange === 'function' ? props.onChange : null;
+
+            if (!modelRef.current) {
+                const seed = rgbToHsv(hexToRgb(color));
+                modelRef.current = { h: seed.h, s: seed.s || 1, v: seed.v };
+                emittedRef.current = color.toLowerCase();
+            }
+
+            const paint = useCallback(() => {
+                const canvas = canvasRef.current;
+                const model = modelRef.current;
+                if (!canvas || !model || typeof canvas.getContext !== 'function') return;
+                let context = null;
+                try {
+                    context = canvas.getContext('2d');
+                } catch {
+                    return;
+                }
+                if (!context) return;
+                const geo = wheelGeometry();
+                const dpr = (typeof window !== 'undefined' && window.devicePixelRatio) || 1;
+                try {
+                    if (canvas.width !== Math.round(geo.size * dpr)) {
+                        canvas.width = Math.round(geo.size * dpr);
+                        canvas.height = Math.round(geo.size * dpr);
+                    }
+                    context.setTransform(dpr, 0, 0, dpr, 0, 0);
+                    context.clearRect(0, 0, geo.size, geo.size);
+                    for (let degree = 0; degree < 360; degree += 2) {
+                        const from = ((degree - 90) * Math.PI) / 180;
+                        const to = ((degree + 1.2 - 90) * Math.PI) / 180;
+                        context.beginPath();
+                        context.arc(geo.centre, geo.centre, geo.outer, from, to);
+                        context.arc(geo.centre, geo.centre, geo.inner, to, from, true);
+                        context.closePath();
+                        context.fillStyle = hsvToHex(degree, 1, 1);
+                        context.fill();
+                    }
+                    context.fillStyle = hsvToHex(model.h, 1, 1);
+                    context.fillRect(geo.left, geo.top, geo.side, geo.side);
+                    const white = context.createLinearGradient(geo.left, 0, geo.left + geo.side, 0);
+                    white.addColorStop(0, '#ffffff');
+                    white.addColorStop(1, 'rgba(255,255,255,0)');
+                    context.fillStyle = white;
+                    context.fillRect(geo.left, geo.top, geo.side, geo.side);
+                    const black = context.createLinearGradient(0, geo.top, 0, geo.top + geo.side);
+                    black.addColorStop(0, 'rgba(0,0,0,0)');
+                    black.addColorStop(1, '#000000');
+                    context.fillStyle = black;
+                    context.fillRect(geo.left, geo.top, geo.side, geo.side);
+                    context.strokeStyle = 'rgba(0,0,0,0.45)';
+                    context.lineWidth = 1;
+                    context.strokeRect(geo.left - 0.5, geo.top - 0.5, geo.side + 1, geo.side + 1);
+                    const angle = ((model.h - 90) * Math.PI) / 180;
+                    const middle = (geo.outer + geo.inner) / 2;
+                    context.beginPath();
+                    context.arc(geo.centre + Math.cos(angle) * middle, geo.centre + Math.sin(angle) * middle, 4.5, 0, Math.PI * 2);
+                    context.strokeStyle = '#000000';
+                    context.lineWidth = 2;
+                    context.stroke();
+                    context.strokeStyle = '#ffffff';
+                    context.lineWidth = 1;
+                    context.stroke();
+                    const svX = geo.left + model.s * geo.side;
+                    const svY = geo.top + (1 - model.v) * geo.side;
+                    context.beginPath();
+                    context.arc(svX, svY, 4.5, 0, Math.PI * 2);
+                    context.strokeStyle = '#000000';
+                    context.lineWidth = 2;
+                    context.stroke();
+                    context.strokeStyle = '#ffffff';
+                    context.lineWidth = 1;
+                    context.stroke();
+                } catch {
+                    /* canvas is optional: never break the editor over a paint error */
+                }
+            }, []);
+
+            useEffect(() => {
+                const model = modelRef.current;
+                if (!model) return;
+                if (emittedRef.current.toLowerCase() !== color.toLowerCase()) {
+                    const next = rgbToHsv(hexToRgb(color));
+                    // Greyscale colours carry no hue: keep the ring where the user left it.
+                    if (next.s > 0) model.h = next.h;
+                    model.s = next.s;
+                    model.v = next.v;
+                    emittedRef.current = color.toLowerCase();
+                }
+                paint();
+            }, [color, paint]);
+
+            const emit = (model) => {
+                const hex = hsvToHex(model.h, model.s, model.v);
+                emittedRef.current = hex;
+                paint();
+                if (onChange && hex.toLowerCase() !== color.toLowerCase()) onChange(hex);
+            };
+
+            const locate = (event) => {
+                const canvas = canvasRef.current;
+                if (!canvas || typeof canvas.getBoundingClientRect !== 'function') return null;
+                const rect = canvas.getBoundingClientRect();
+                const size = WHEEL_PIXELS;
+                const width = rect.width || size;
+                const height = rect.height || size;
+                // The canvas may be scaled down by CSS in a narrow panel; map the
+                // pointer back into wheel pixels before classifying it.
+                const x = ((event.clientX - rect.left) * size) / width;
+                const y = ((event.clientY - rect.top) * size) / height;
+                return wheelHitTest(x, y);
+            };
+
+            // Extremes are snapped so the border really reaches #ffffff / #000000 /
+            // a fully saturated hue instead of stopping one byte short.
+            const SNAP = 0.02;
+            const snap = (value) => (value <= SNAP ? 0 : value >= 1 - SNAP ? 1 : value);
+
+            const apply = (hit) => {
+                const model = modelRef.current;
+                if (!model || !hit) return;
+                if (hit.mode === 'hue') {
+                    model.h = ((hit.angle * 180) / Math.PI + 90 + 360) % 360;
+                    if (model.s === 0) model.s = 1;
+                    if (model.v === 0) model.v = 1;
+                } else {
+                    model.s = snap(clamp((hit.x - hit.geo.left) / hit.geo.side, 0, 1));
+                    model.v = snap(clamp(1 - (hit.y - hit.geo.top) / hit.geo.side, 0, 1));
+                }
+                emit(model);
+            };
+
+            const onPointerDown = (event) => {
+                const hit = locate(event);
+                if (!hit) return;
+                if (event.preventDefault) event.preventDefault();
+                dragRef.current = hit.mode;
+                const canvas = canvasRef.current;
+                if (canvas && typeof canvas.setPointerCapture === 'function') {
+                    try {
+                        canvas.setPointerCapture(event.pointerId);
+                    } catch {
+                        /* capture is best effort */
+                    }
+                }
+                apply(hit);
+            };
+
+            const onPointerMove = (event) => {
+                if (!dragRef.current) return;
+                apply(locate(event));
+            };
+
+            const endDrag = () => {
+                dragRef.current = null;
+            };
+
+            return h('div', { className: 'pxs-wheel-wrap' },
+                h('canvas', {
+                    ref: canvasRef,
+                    className: 'pxs-wheel',
+                    onPointerDown,
+                    onPointerMove,
+                    onPointerUp: endDrag,
+                    onPointerCancel: endDrag,
+                    title: '取色环：外圈选色相，中间方块选明暗',
+                }),
+                h('div', { className: 'pxs-wheel-actions' },
+                    h('button', {
+                        type: 'button',
+                        className: 'pxs-btn pxs-wheel-complement',
+                        title: '把当前颜色换成它的互补色（色相 +180°）',
+                        onClick: () => {
+                            const model = modelRef.current;
+                            if (!model) return;
+                            const next = complementHsv(model.h, model.s, model.v);
+                            model.h = next.h;
+                            model.s = next.s;
+                            model.v = next.v;
+                            emit(model);
+                        },
+                    }, '取互补色')));
+        }
 
         /**
          * In-memory clipboard for the selection tool. Intentionally not persisted:
@@ -1239,12 +1702,23 @@ window.__ModuleLoader__.load({
             const [creating, setCreating] = useState(false);
             const [newDialog, setNewDialog] = useState(null);
             const [showGrid, setShowGrid] = useState(() => readStored('pxs:grid', '1') !== '0');
+            /** Hide the host's chat composer while the studio is on screen. */
+            const [hideComposer, setHideComposer] = useState(() => readStored('pxs:hideComposer', '1') !== '0');
+            /** Follow window/shell resizes by reframing the artwork. */
+            const [autoFit, setAutoFit] = useState(() => readStored('pxs:autoFit', '1') !== '0');
             const [leftWidth, setLeftWidth] = useState(() => clamp(readStoredNumber('pxs:left', 196), 132, 360));
             const [rightWidth, setRightWidth] = useState(() => clamp(readStoredNumber('pxs:right', 216), 152, 420));
             const [renaming, setRenaming] = useState(-1);
             const [renameValue, setRenameValue] = useState('');
             const [saveDialog, setSaveDialog] = useState(null);
             const [editing, setEditing] = useState(null);
+            /**
+             * Colour edits live in a draft until 「完成」 is pressed. Nothing in the
+             * document changes while dragging the wheel, so switching to another
+             * swatch (or pressing Esc) simply drops the draft instead of silently
+             * saving a colour the user never confirmed.
+             */
+            const [draftColor, setDraftColor] = useState(null);
             const [importDialog, setImportDialog] = useState(null);
             const [resizeDialog, setResizeDialog] = useState(null);
             const [selection, setSelection] = useState(null);
@@ -1286,11 +1760,18 @@ window.__ModuleLoader__.load({
             const editingRef = useRef(null);
             /** Colour the edited slot had when the editor opened (before any edit). */
             const editSessionRef = useRef(null);
+            /** Pending (uncommitted) colour for the slot open in the editor. */
+            const draftEditRef = useRef(null);
             const hexInputRef = useRef(null);
             const nativeColorRef = useRef(null);
             const frameRef = useRef(0);
             const mainRef = useRef(null);
             const gridRef = useRef(true);
+            // Last measured stage size: a window resize recentres the artwork.
+            const viewportRef = useRef({ width: 0, height: 0 });
+            // Zoom produced by the last "fit": while the zoom still equals it, a
+            // window resize re-frames the artwork instead of only recentring it.
+            const fitZoomRef = useRef(0);
             const splitRef = useRef(null);
             const sizeRef = useRef({ left: 196, right: 216 });
             // Indirection for the save-as action: the keyboard effect is registered
@@ -1305,12 +1786,18 @@ window.__ModuleLoader__.load({
             const selectApiRef = useRef({});
             const grabRef = useRef(false);
             const allLayersRef = useRef(false);
+            const hideComposerRef = useRef(true);
+            const autoFitRef = useRef(true);
+            /** Re-runs the shell sweep; set by the hide effect, used by the toggle. */
+            const shellSweepRef = useRef(null);
 
             if (gridRef.current !== showGrid) gridRef.current = showGrid;
             sizeRef.current = { left: leftWidth, right: rightWidth };
             if (editingRef.current !== editing) editingRef.current = editing;
             if (grabRef.current !== grabMode) grabRef.current = grabMode;
             if (allLayersRef.current !== allLayersMode) allLayersRef.current = allLayersMode;
+            if (hideComposerRef.current !== hideComposer) hideComposerRef.current = hideComposer;
+            if (autoFitRef.current !== autoFit) autoFitRef.current = autoFit;
             selectionRef.current = selection;
 
             docRef.current = doc;
@@ -1496,29 +1983,81 @@ window.__ModuleLoader__.load({
                 frameRef.current = window.requestAnimationFrame(paint);
             }, [paint]);
 
+            /**
+             * Change the zoom while holding one point of the artwork still.
+             * Buttons and shortcuts anchor on the middle of the visible stage,
+             * the wheel anchors on the pointer; both keep the drawing from
+             * sliding away as it scales.
+             */
+            const zoomTo = useCallback((next, anchorX, anchorY) => {
+                const current = scaleRef.current || 1;
+                const target = clampZoom(next);
+                if (Math.abs(target - current) < 0.0005) return;
+                const stage = stageRef.current;
+                const width = stage ? stage.clientWidth : 0;
+                const height = stage ? stage.clientHeight : 0;
+                const ax = Number.isFinite(anchorX) ? anchorX : width / 2;
+                const ay = Number.isFinite(anchorY) ? anchorY : height / 2;
+                const pan = panRef.current;
+                panRef.current = {
+                    x: ax - ((ax - pan.x) / current) * target,
+                    y: ay - ((ay - pan.y) / current) * target,
+                };
+                scaleRef.current = target;
+                setZoom(target);
+                requestPaint();
+            }, [requestPaint]);
+
+            /**
+             * Buttons and shortcuts scale by a fixed ratio instead of jumping
+             * through ZOOMS, so a fitted 19× canvas steps to 28.5× rather than
+             * snapping back to 16× first. Fractional zoom is allowed everywhere.
+             */
+            const zoomStep = useCallback((direction) => {
+                const current = scaleRef.current || 1;
+                zoomTo(current * (direction > 0 ? 1.5 : 1 / 1.5));
+            }, [zoomTo]);
+
             const fitToView = useCallback(() => {
                 const stage = stageRef.current;
                 const current = docRef.current;
                 if (!stage || !current) return;
-                const width = Math.max(1, stage.clientWidth);
-                const height = Math.max(1, stage.clientHeight);
-                const raw = Math.min((width - 48) / current.w, (height - 48) / current.h);
-                let scale = 1;
+                const padding = 24;
+                const width = Math.max(1, Math.round(stage.clientWidth));
+                const height = Math.max(1, Math.round(stage.clientHeight));
+                // Hidden tabs report a zero-sized stage; wait for a real layout.
+                if (width <= padding * 2 || height <= padding * 2) return;
+                const raw = Math.min((width - padding) / current.w, (height - padding) / current.h);
+                let scale = ZOOMS[0];
                 for (const candidate of ZOOMS) {
                     if (candidate <= raw) scale = candidate;
                 }
-                if (raw >= 1) {
-                    let best = 1;
-                    for (const candidate of ZOOMS) if (candidate <= raw) best = candidate;
-                    scale = best;
-                }
                 scaleRef.current = scale;
+                fitZoomRef.current = scale;
                 setZoom(scale);
                 panRef.current = {
                     x: Math.round((width - current.w * scale) / 2),
                     y: Math.round((height - current.h * scale) / 2),
                 };
+                viewportRef.current = { width, height };
                 requestPaint();
+                // The panel may still be settling (window resize, splitter drag):
+                // re-centre once on the next frame with the final measurements.
+                window.requestAnimationFrame(() => {
+                    const settled = stageRef.current;
+                    const target = docRef.current;
+                    if (!settled || !target) return;
+                    const nextWidth = Math.max(1, Math.round(settled.clientWidth));
+                    const nextHeight = Math.max(1, Math.round(settled.clientHeight));
+                    if (nextWidth === width && nextHeight === height) return;
+                    const active = scaleRef.current;
+                    panRef.current = {
+                        x: Math.round((nextWidth - target.w * active) / 2),
+                        y: Math.round((nextHeight - target.h * active) / 2),
+                    };
+                    viewportRef.current = { width: nextWidth, height: nextHeight };
+                    requestPaint();
+                });
             }, [requestPaint]);
 
             /* -------------------------------------------------------------- */
@@ -1541,6 +2080,8 @@ window.__ModuleLoader__.load({
                 setColorIndex(0);
                 setEditing(null);
                 editingRef.current = null;
+                draftEditRef.current = null;
+                setDraftColor(null);
                 historyRef.current = { undo: [], redo: [] };
                 if (switched) {
                     // Selection coordinates belong to the document that was open;
@@ -2181,28 +2722,194 @@ window.__ModuleLoader__.load({
                     const mx = event.clientX - rect.left;
                     const my = event.clientY - rect.top;
                     const current = scaleRef.current;
-                    const position = ZOOMS.indexOf(current);
-                    const base = position === -1 ? 0 : position;
-                    const step = event.deltaY > 0 ? -1 : 1;
-                    const next = ZOOMS[Math.max(0, Math.min(ZOOMS.length - 1, base + step))];
-                    if (next === current) return;
-                    panRef.current = {
-                        x: mx - ((mx - panRef.current.x) / current) * next,
-                        y: my - ((my - panRef.current.y) / current) * next,
-                    };
-                    scaleRef.current = next;
-                    setZoom(next);
-                    requestPaint();
+                    // Trackpads send many small deltas; an exponential factor keeps
+                    // the same gesture smooth at every zoom level.
+                    const next = clampZoom(current * Math.exp(-event.deltaY * 0.0015));
+                    if (Math.abs(next - current) < 0.0005) return;
+                    zoomTo(next, mx, my);
                 };
                 stage.addEventListener('wheel', onWheel, { passive: false });
                 return () => stage.removeEventListener('wheel', onWheel);
-            }, [requestPaint]);
+            }, [zoomTo]);
 
             useEffect(() => {
-                const observer = new ResizeObserver(() => requestPaint());
-                if (stageRef.current) observer.observe(stageRef.current);
+                const stage = stageRef.current;
+                if (!stage) return undefined;
+                // Keep the artwork centred on the same document point while the
+                // stage grows or shrinks (window resize, splitter drag, tab swap).
+                const syncViewport = () => {
+                    const width = Math.max(1, Math.round(stage.clientWidth));
+                    const height = Math.max(1, Math.round(stage.clientHeight));
+                    const previous = viewportRef.current;
+                    if (previous.width !== width || previous.height !== height) {
+                        if (previous.width > 0 && previous.height > 0) {
+                            // A resized window should re-frame the artwork. Once the
+                            // user picks a zoom of their own — or switches auto-fit
+                            // off — keep it and just stay centred on the same spot.
+                            if (autoFitRef.current && Math.abs(scaleRef.current - fitZoomRef.current) < 0.0005) {
+                                fitToView();
+                                return;
+                            }
+                            panRef.current = {
+                                x: panRef.current.x + (width - previous.width) / 2,
+                                y: panRef.current.y + (height - previous.height) / 2,
+                            };
+                            viewportRef.current = { width, height };
+                        } else {
+                            // First real measurement (the tab was hidden while
+                            // mounting): frame the artwork instead of guessing a pan.
+                            viewportRef.current = { width, height };
+                            fitToView();
+                            return;
+                        }
+                    }
+                    requestPaint();
+                };
+                syncViewport();
+                const observer = new ResizeObserver(syncViewport);
+                observer.observe(stage);
                 return () => observer.disconnect();
-            }, [requestPaint]);
+            }, [fitToView, requestPaint]);
+
+            useEffect(() => {
+                // The harness view area is sized by its content, so a studio taller
+                // than the chat viewport pushes a scrollbar onto the whole tab. Size
+                // the root to the visible part of the nearest scroll container so the
+                // plugin fills the tab instead of extending it.
+                if (typeof window === 'undefined' || typeof document === 'undefined') return undefined;
+                if (typeof window.getComputedStyle !== 'function') return undefined;
+                let observer = null;
+                let watched = null;
+                const fit = () => {
+                    const root = rootRef.current;
+                    if (!root || !root.parentElement) return;
+                    let scroller = null;
+                    let node = root.parentElement;
+                    while (node && node !== document.body && node !== document.documentElement) {
+                        const style = window.getComputedStyle(node);
+                        if (style && /(auto|scroll)/.test(String(style.overflowY))) {
+                            scroller = node;
+                            break;
+                        }
+                        node = node.parentElement;
+                    }
+                    const viewport = window.innerHeight || 0;
+                    let available = viewport - 140;
+                    if (scroller) {
+                        const rect = root.getBoundingClientRect();
+                        const box = scroller.getBoundingClientRect();
+                        available = Math.floor(scroller.clientHeight - (rect.top - box.top) - 1);
+                    }
+                    if (available < 240) available = 240;
+                    // CSS custom property instead of style.height: React re-renders the
+                    // root's style prop, and a variable survives those diffs untouched.
+                    root.style.setProperty('--pxs-root-height', `${available}px`);
+                    if (scroller && typeof ResizeObserver === 'function' && watched !== scroller) {
+                        if (observer) observer.disconnect();
+                        watched = scroller;
+                        observer = new ResizeObserver(fit);
+                        observer.observe(scroller);
+                    }
+                };
+                fit();
+                window.addEventListener('resize', fit);
+                return () => {
+                    window.removeEventListener('resize', fit);
+                    if (observer) observer.disconnect();
+                };
+            }, []);
+
+            useEffect(() => {
+                // The conversation shell parks a draggable width handle over both
+                // edges of the view area so the chat column can be resized. Over a
+                // full-bleed editor it is pure clutter, so hide it while the studio
+                // is mounted and hand the original value back on unmount.
+                if (typeof window === 'undefined' || typeof document === 'undefined') return undefined;
+                const studioRoot = rootRef.current;
+                const studioBody = document.body;
+                if (!studioRoot || !studioBody) return undefined;
+                if (typeof studioBody.querySelectorAll !== 'function') return undefined;
+                const hiddenHandles = new Map();
+                const hiddenComposer = new Map();
+                const computedStyleOf = typeof window.getComputedStyle === 'function'
+                    ? (element) => window.getComputedStyle(element)
+                    : null;
+                let handleFallbackDone = false;
+                const sweepHandles = () => {
+                    try {
+                        if (typeof studioRoot.isConnected === 'boolean' && !studioRoot.isConnected) return;
+                        // Another tab may own the view area right now: only strip the
+                        // handles while the studio itself is actually on screen.
+                        const box = typeof studioRoot.getBoundingClientRect === 'function'
+                            ? studioRoot.getBoundingClientRect()
+                            : null;
+                        if (box && (box.width <= 0 || box.height <= 0)) {
+                            restoreShellHandles(hiddenHandles);
+                            restoreShellHandles(hiddenComposer);
+                            return;
+                        }
+                        const matched = hideShellHandles(studioRoot, studioBody, hiddenHandles, handleFallbackDone ? null : computedStyleOf);
+                        if (matched > 0) handleFallbackDone = true;
+                        if (hideComposerRef.current) hideShellComposer(studioRoot, studioBody, hiddenComposer);
+                        else restoreShellHandles(hiddenComposer);
+                    } catch {
+                        // Decoration cleanup must never break the editor.
+                    }
+                };
+                let handleFrame = 0;
+                const scheduleHandleSweep = () => {
+                    if (handleFrame) return;
+                    if (typeof window.requestAnimationFrame !== 'function') {
+                        sweepHandles();
+                        return;
+                    }
+                    handleFrame = window.requestAnimationFrame(() => {
+                        handleFrame = 0;
+                        sweepHandles();
+                    });
+                };
+                sweepHandles();
+                shellSweepRef.current = scheduleHandleSweep;
+                let handleObserver = null;
+                if (typeof MutationObserver === 'function') {
+                    try {
+                        handleObserver = new MutationObserver(scheduleHandleSweep);
+                        handleObserver.observe(studioBody, { childList: true, subtree: true });
+                    } catch {
+                        handleObserver = null;
+                    }
+                }
+                return () => {
+                    shellSweepRef.current = null;
+                    if (handleObserver) handleObserver.disconnect();
+                    if (handleFrame && typeof window.cancelAnimationFrame === 'function') window.cancelAnimationFrame(handleFrame);
+                    restoreShellHandles(hiddenHandles);
+                    restoreShellHandles(hiddenComposer);
+                };
+            }, []);
+
+            useEffect(() => {
+                const root = rootRef.current;
+                if (!root || typeof root.addEventListener !== 'function') return undefined;
+                // Browser-level zoom (Ctrl/Cmd + wheel or + / -) over the studio
+                // must not rescale the whole panel out from under the canvas.
+                const blockWheelZoom = (event) => {
+                    if (!event.ctrlKey && !event.metaKey) return;
+                    event.preventDefault();
+                };
+                const blockKeyZoom = (event) => {
+                    if (!event.ctrlKey && !event.metaKey) return;
+                    if (event.key === '+' || event.key === '=' || event.key === '-' || event.key === '_' || event.key === '0') {
+                        event.preventDefault();
+                    }
+                };
+                root.addEventListener('wheel', blockWheelZoom, { passive: false });
+                root.addEventListener('keydown', blockKeyZoom);
+                return () => {
+                    root.removeEventListener('wheel', blockWheelZoom);
+                    root.removeEventListener('keydown', blockKeyZoom);
+                };
+            }, []);
 
             useEffect(() => {
                 const onKeyDown = (event) => {
@@ -2311,17 +3018,11 @@ window.__ModuleLoader__.load({
                     else if (key === '[') setBrush((value) => Math.max(1, value - 1));
                     else if (key === ']') setBrush((value) => Math.min(8, value + 1));
                     else if (key === '+' || key === '=') {
-                        const position = ZOOMS.indexOf(scaleRef.current);
-                        const next = ZOOMS[Math.min(ZOOMS.length - 1, (position === -1 ? 0 : position) + 1)];
-                        scaleRef.current = next;
-                        setZoom(next);
-                        requestPaint();
+                        event.preventDefault();
+                        zoomStep(1);
                     } else if (key === '-' || key === '_') {
-                        const position = ZOOMS.indexOf(scaleRef.current);
-                        const next = ZOOMS[Math.max(0, (position === -1 ? 0 : position) - 1)];
-                        scaleRef.current = next;
-                        setZoom(next);
-                        requestPaint();
+                        event.preventDefault();
+                        zoomStep(-1);
                     }
                 };
                 const onKeyUp = (event) => {
@@ -2336,7 +3037,7 @@ window.__ModuleLoader__.load({
                     window.removeEventListener('keydown', onKeyDown);
                     window.removeEventListener('keyup', onKeyUp);
                 };
-            }, [fitToView, redo, requestPaint, saveNow, undo]);
+            }, [fitToView, redo, requestPaint, saveNow, undo, zoomStep]);
 
             useEffect(() => {
                 const close = () => setMenu(null);
@@ -2384,6 +3085,8 @@ window.__ModuleLoader__.load({
                     setLayerIndex(0);
                     setColorIndex(0);
                     editSessionRef.current = null;
+                    draftEditRef.current = null;
+                    setDraftColor(null);
                     setEditing(null);
                     historyRef.current = { undo: [], redo: [] };
                     await refreshDocs();
@@ -2599,6 +3302,8 @@ window.__ModuleLoader__.load({
                         setLayerIndex(0);
                         setColorIndex(0);
                         editSessionRef.current = null;
+                        draftEditRef.current = null;
+                        setDraftColor(null);
                         setEditing(null);
                         historyRef.current = { undo: [], redo: [] };
                         setImportDialog(null);
@@ -2683,74 +3388,103 @@ window.__ModuleLoader__.load({
                 scheduleSave();
             }, [pushHistory, requestPaint, scheduleSave]);
 
+            /** Put a slot's colour into the draft and open the editor on it. */
+            const armEdit = useCallback((index, color) => {
+                draftEditRef.current = { index, color };
+                setDraftColor(draftEditRef.current);
+                setEditing(index);
+            }, []);
+
             const beginEdit = useCallback((index) => {
                 const current = docRef.current;
                 if (!current || index < 0 || index >= current.palette.length) return;
-                pushHistory();
                 setColorIndex(index);
                 colorRef.current = index;
-                editSessionRef.current = { index, color: current.palette[index], detached: false };
-                setEditing(index);
-            }, [pushHistory]);
+                editSessionRef.current = { index, color: current.palette[index] };
+                armEdit(index, current.palette[index]);
+            }, [armEdit]);
 
+            /** Drop the draft. Nothing was written to the document, so this is safe. */
             const endEdit = useCallback(() => {
                 editSessionRef.current = null;
+                draftEditRef.current = null;
+                setDraftColor(null);
                 setEditing(null);
             }, []);
+
+            /**
+             * Change the *draft* colour only. The document — and therefore every
+             * pixel colour on the canvas — is untouched until `commitEdit`, so
+             * switching swatches cannot silently save an edit.
+             */
+            const previewEditColor = useCallback((color) => {
+                const index = editingRef.current;
+                if (index === null || index === undefined) return;
+                const text = String(color || '').trim().toLowerCase();
+                if (!/^#[0-9a-f]{6}$/.test(text)) return;
+                if (!docRef.current) return;
+                draftEditRef.current = { index, color: text };
+                setDraftColor(draftEditRef.current);
+                if (hexInputRef.current) hexInputRef.current.value = text.toUpperCase();
+            }, []);
+
+            /**
+             * Write the draft, from 「完成」. All the safety lives in
+             * `recolourSlot`, which repoints every pixel that still uses the slot
+             * before the colour changes — editing a palette entry can never
+             * repaint the artwork, no matter how the editor was opened.
+             */
+            const commitEdit = useCallback(() => {
+                const draft = draftEditRef.current;
+                const current = docRef.current;
+                if (!draft || !current) {
+                    endEdit();
+                    return;
+                }
+                const index = draft.index;
+                const original = current.palette[index];
+                if (!original || String(original).toLowerCase() === draft.color) {
+                    endEdit();
+                    return;
+                }
+                const result = recolourSlot(current, index, draft.color);
+                if (!result || result.error) {
+                    if (result && result.error === 'full') {
+                        setNotice(`调色板已满（${CHARS.length} 色），先删掉一个用不到的颜色再改这个`);
+                        return;
+                    }
+                    endEdit();
+                    return;
+                }
+                pushHistory();
+                if (result.movedTo >= 0) {
+                    setNotice(`改好了：画布上的旧颜色已由色板 #${result.movedTo + 1} 接手，画布未改动`);
+                } else if (result.created) {
+                    setNotice('改好了：新建了一个色板槽位接手画布上的旧颜色，画布未改动');
+                }
+                docRef.current = result.doc;
+                setDoc(result.doc);
+                requestPaint();
+                scheduleSave();
+                endEdit();
+            }, [endEdit, pushHistory, requestPaint, scheduleSave]);
 
             const editColor = useCallback((index) => {
                 beginEdit(index);
             }, [beginEdit]);
 
-            /**
-             * Apply a colour to the slot the editor is showing. The first change
-             * of a session first parks the artwork's pixels on their own slot, so
-             * editing a palette colour never repaints the existing canvas.
-             */
-            const applyEditColor = useCallback((target, color) => {
-                const current = docRef.current;
-                if (!current) return;
-                const index = typeof target === 'number' ? target : editingRef.current;
-                if (index === null || index === undefined) return;
-                if (index < 0 || index >= current.palette.length) return;
-                const nextColor = String(color || '').toLowerCase();
-                if (!/^#[0-9a-f]{6}$/.test(nextColor)) return;
-                if (current.palette[index].toLowerCase() === nextColor) return;
-                let base = current;
-                const session = editSessionRef.current;
-                if (session && session.index === index && !session.detached) {
-                    const detached = detachSlot(base, index);
-                    if (!detached) {
-                        setNotice(`调色板已满（${CHARS.length} 色），先删掉一个用不到的颜色再改这个`);
-                        return;
-                    }
-                    session.detached = true;
-                    base = detached.doc;
-                    if (detached.target >= 0) {
-                        setNotice(`画布上的旧颜色已由色板 #${detached.target + 1} 接手，画布未改动`);
-                    }
-                }
-                const palette = base.palette.slice();
-                palette[index] = nextColor;
-                const next = { ...base, palette };
-                docRef.current = next;
-                setDoc(next);
-                requestPaint();
-                scheduleSave();
-            }, [requestPaint, scheduleSave]);
-
             const setEditChannel = useCallback((channel, value) => {
                 const current = docRef.current;
                 if (!current || editingRef.current === null) return;
                 const index = editingRef.current;
-                const color = current.palette[index];
+                const draft = draftEditRef.current;
+                const color = draft && draft.index === index ? draft.color : current.palette[index];
                 if (!color) return;
                 const rgb = hexToRgb(color);
                 rgb[channel] = clamp(Math.round(Number(value) || 0), 0, 255);
                 const hex = `#${rgb.map((part) => part.toString(16).padStart(2, '0')).join('')}`;
-                applyEditColor(index, hex);
-                if (hexInputRef.current) hexInputRef.current.value = hex.toUpperCase();
-            }, [applyEditColor]);
+                previewEditColor(hex);
+            }, [previewEditColor]);
 
             const setEditHex = useCallback((value) => {
                 const index = editingRef.current;
@@ -2764,22 +3498,23 @@ window.__ModuleLoader__.load({
                     setNotice('颜色要写成 #rrggbb 或 #rgb');
                     return;
                 }
-                applyEditColor(index, text);
-            }, [applyEditColor]);
+                previewEditColor(text);
+            }, [previewEditColor]);
 
             /**
              * Open the system colour picker. Chrome keeps the input's current
-             * value as the starting colour, so seed it from the slot first; the
-             * in-app sliders/HEX box stay as the precise path.
+             * value as the starting colour, so seed it from the draft (or the
+             * slot when there is no draft yet); the in-app sliders/HEX box stay
+             * as the precise path.
              */
             const openNativePicker = useCallback(() => {
                 const input = nativeColorRef.current;
                 const current = docRef.current;
                 const index = editingRef.current;
                 if (!input || !current || index === null) return;
-                input.value = /^#[0-9a-f]{6}$/i.test(current.palette[index] || '')
-                    ? current.palette[index]
-                    : '#000000';
+                const draft = draftEditRef.current;
+                const base = draft && draft.index === index ? draft.color : current.palette[index];
+                input.value = /^#[0-9a-f]{6}$/i.test(base || '') ? base : '#000000';
                 try {
                     if (typeof input.showPicker === 'function') {
                         input.showPicker();
@@ -2792,13 +3527,10 @@ window.__ModuleLoader__.load({
             }, []);
 
             const onNativeColor = useCallback((event) => {
-                const index = editingRef.current;
-                if (index === null) return;
                 const value = String(event.target.value || '').toLowerCase();
                 if (!/^#[0-9a-f]{6}$/.test(value)) return;
-                applyEditColor(index, value);
-                if (hexInputRef.current) hexInputRef.current.value = value.toUpperCase();
-            }, [applyEditColor]);
+                previewEditColor(value);
+            }, [previewEditColor]);
 
             const addColor = useCallback(() => {
                 const current = docRef.current;
@@ -2809,8 +3541,8 @@ window.__ModuleLoader__.load({
                 }
                 const palette = current.palette.concat(nextFreeColor(current.palette));
                 updatePalette(palette, { color: palette.length - 1 });
-                setEditing(palette.length - 1);
-            }, [updatePalette]);
+                armEdit(palette.length - 1, palette[palette.length - 1]);
+            }, [armEdit, updatePalette]);
 
             const removeColor = useCallback((index) => {
                 const current = docRef.current;
@@ -2831,12 +3563,22 @@ window.__ModuleLoader__.load({
                 docRef.current = next;
                 setDoc(next);
                 setColorIndex((value) => Math.max(0, Math.min(value, palette.length - 1)));
-                // Keep the color editor pointing at a slot that still exists.
+                // Keep the color editor (and its draft) pointing at a slot that still exists.
                 setEditing((value) => {
                     if (value === null) return null;
                     if (value === index) return null;
                     return value > index ? value - 1 : value;
                 });
+                const draft = draftEditRef.current;
+                if (draft) {
+                    if (draft.index === index) {
+                        draftEditRef.current = null;
+                        setDraftColor(null);
+                    } else if (draft.index > index) {
+                        draftEditRef.current = { index: draft.index - 1, color: draft.color };
+                        setDraftColor(draftEditRef.current);
+                    }
+                }
                 requestPaint();
                 scheduleSave();
             }, [requestPaint, scheduleSave]);
@@ -3172,27 +3914,39 @@ window.__ModuleLoader__.load({
                 h('button', {
                     className: 'pxs-btn',
                     title: '缩小 (-)',
-                    onClick: () => {
-                        const position = ZOOMS.indexOf(scaleRef.current);
-                        const next = ZOOMS[Math.max(0, (position === -1 ? 0 : position) - 1)];
-                        scaleRef.current = next;
-                        setZoom(next);
-                        requestPaint();
-                    },
+                    onClick: () => zoomStep(-1),
                 }, '−'),
-                h('span', { className: 'pxs-hex', style: { minWidth: 42, textAlign: 'center' } }, `${zoom}×`),
+                h('input', {
+                    className: 'pxs-zoom-range',
+                    type: 'range',
+                    min: 0,
+                    max: ZOOM_SLIDER_STEPS,
+                    step: 1,
+                    value: zoomToSlider(zoom),
+                    disabled: !doc,
+                    title: '拖动缩放（对数刻度，支持非整数倍）',
+                    onChange: (event) => zoomTo(sliderToZoom(event.target.value)),
+                }),
+                h('span', { className: 'pxs-hex pxs-zoom-label' },
+                    `${formatZoom(zoom)}×`),
                 h('button', {
                     className: 'pxs-btn',
                     title: '放大 (+)',
-                    onClick: () => {
-                        const position = ZOOMS.indexOf(scaleRef.current);
-                        const next = ZOOMS[Math.min(ZOOMS.length - 1, (position === -1 ? 0 : position) + 1)];
-                        scaleRef.current = next;
-                        setZoom(next);
-                        requestPaint();
-                    },
+                    onClick: () => zoomStep(1),
                 }, '+'),
                 h('button', { className: 'pxs-btn', title: '适应窗口 (F)', onClick: fitToView }, '适应'),
+                h('button', {
+                    className: 'pxs-btn',
+                    'data-active': autoFit,
+                    title: '窗口大小变化时自动适应画布大小',
+                    onClick: () => {
+                        const next = !autoFitRef.current;
+                        autoFitRef.current = next;
+                        setAutoFit(next);
+                        storeValue('pxs:autoFit', next ? '1' : '0');
+                        if (next) fitToView();
+                    },
+                }, autoFit ? '自适应开' : '自适应关'),
                 h('button', {
                     className: 'pxs-btn',
                     'data-active': showGrid,
@@ -3205,6 +3959,18 @@ window.__ModuleLoader__.load({
                         requestPaint();
                     },
                 }, showGrid ? '格线开' : '格线关'),
+                h('button', {
+                    className: 'pxs-btn',
+                    'data-active': hideComposer,
+                    title: '隐藏/显示下方的对话输入框',
+                    onClick: () => {
+                        const next = !hideComposerRef.current;
+                        hideComposerRef.current = next;
+                        setHideComposer(next);
+                        storeValue('pxs:hideComposer', next ? '1' : '0');
+                        if (shellSweepRef.current) shellSweepRef.current();
+                    },
+                }, hideComposer ? '对话框隐藏' : '对话框显示'),
                 h('button', {
                     className: 'pxs-btn',
                     disabled: !doc,
@@ -3227,7 +3993,8 @@ window.__ModuleLoader__.load({
                 }, '删除'),
                 h('span', { className: 'pxs-status', 'data-state': status }, statusText),
                 selection ? h('span', { className: 'pxs-status pxs-select-status', title: '选区：拖动移框，Shift+拖动带内容，方向键微调，Esc 取消' }, selectionText) : null,
-                notice ? h('span', { className: 'pxs-notice', title: notice }, notice) : null);
+                notice ? h('div', { className: 'pxs-bar-center' },
+                    h('span', { className: 'pxs-notice', title: notice }, notice)) : null);
 
             const errorNode = error ? h('div', { className: 'pxs-error' },
                 `${error}`,
@@ -3506,11 +4273,37 @@ window.__ModuleLoader__.load({
                     onClick: () => applyPreset(preset),
                 }, preset.name))));
 
-            const editColorValue = doc && editing !== null && editing < doc.palette.length ? doc.palette[editing] : null;
+            const draftEdit = draftColor && editing !== null && draftColor.index === editing ? draftColor : null;
+            const editColorValue = !doc || editing === null || editing >= doc.palette.length
+                ? null
+                : draftEdit
+                    ? draftEdit.color
+                    : doc.palette[editing];
             const editRgb = editColorValue ? hexToRgb(editColorValue) : [0, 0, 0];
+            const editOriginal = doc && editing !== null && editing < doc.palette.length ? doc.palette[editing] : null;
+            const editPending = Boolean(draftEdit) && doc && doc.palette[editing] !== draftEdit.color;
 
             const colorEditNode = editColorValue === null ? null : h('div', { className: 'pxs-section pxs-color-edit' },
                 h('p', { className: 'pxs-title' }, `改色 #${editing}`),
+                h('div', { className: 'pxs-color-compare' },
+                    h('div', { className: 'pxs-compare-cell' },
+                        h('span', {
+                            className: 'pxs-compare-chip pxs-compare-before',
+                            style: { background: editOriginal || 'transparent' },
+                            title: `原色 ${String(editOriginal || '—').toUpperCase()}`,
+                        }),
+                        h('span', { className: 'pxs-compare-label' },
+                            h('span', { className: 'pxs-compare-key' }, '原色'),
+                            h('span', { className: 'pxs-compare-hex' }, String(editOriginal || '—').toUpperCase()))),
+                    h('div', { className: 'pxs-compare-cell' },
+                        h('span', {
+                            className: 'pxs-compare-chip pxs-compare-after',
+                            style: { background: editColorValue || 'transparent' },
+                            title: `新色 ${String(editColorValue || '—').toUpperCase()}`,
+                        }),
+                        h('span', { className: 'pxs-compare-label' },
+                            h('span', { className: 'pxs-compare-key' }, '新色'),
+                            h('span', { className: 'pxs-compare-hex' }, String(editColorValue || '—').toUpperCase())))),
                 h('div', { className: 'pxs-color-edit-head' },
                     h('input', {
                         key: `native-${editing}`,
@@ -3535,12 +4328,20 @@ window.__ModuleLoader__.load({
                         },
                         onBlur: (event) => setEditHex(event.currentTarget.value),
                     }),
-                    h('button', { className: 'pxs-btn', onClick: endEdit, title: '关闭改色面板' }, '完成')),
+                    h('button', { className: 'pxs-btn', onClick: endEdit, title: '放弃这次改色（Esc）' }, '取消'),
+                    h('button', { className: 'pxs-btn pxs-btn-primary', onClick: commitEdit, title: '保存这个颜色' }, '完成')),
                 h('button', {
                     className: 'pxs-btn pxs-picker-btn',
                     onClick: openNativePicker,
                     title: '打开系统取色器',
                 }, '取色器…'),
+                h(ColorWheel, {
+                    color: editColorValue,
+                    onChange: (hex) => previewEditColor(hex),
+                }),
+                h('p', { className: 'pxs-hint pxs-wheel-hint' }, '取色环：外圈拖出色相，中间方块拖出明暗。'),
+                h('p', { className: 'pxs-hint pxs-wheel-hint' },
+                    editPending ? '未保存 · 点「完成」才会写入这个色板槽位' : '点「完成」才会写入色板；直接切到别的颜色算放弃。'),
                 h('p', { className: 'pxs-hint' }, '改色只改这个色板槽位，画布上已有的像素颜色不变。'),
                 h('div', { className: 'pxs-color-edit-sliders' },
                     ['R', 'G', 'B'].map((label, channel) => h('label', { key: label, className: 'pxs-slider-row' },
@@ -4023,6 +4824,33 @@ window.__ModuleLoader__.load({
                 emptyRows,
                 mirrorRows,
                 mergedRegion,
+            };
+            window.__PXS_TEST__.color = {
+                rgbToHsv,
+                hsvToRgb,
+                hsvToHex,
+                hexToRgb,
+                complementHsv,
+                wheelGeometry,
+                wheelHitTest,
+            };
+            // Palette edits must be provably canvas-neutral, so the helpers that
+            // enforce it are testable on their own.
+            window.__PXS_TEST__.palette = {
+                detachSlot,
+                remapSlot,
+                slotInUse,
+                recolourSlot,
+                chars: CHARS,
+            };
+            // The shell width handle sweep touches the host DOM, so it is driven
+            // through plain helpers that can be fed fake elements.
+            window.__PXS_TEST__.handles = {
+                hideShellHandles,
+                hideShellComposer,
+                restoreShellHandles,
+                selector: SHELL_HANDLE_SELECTOR,
+                composerSelector: SHELL_COMPOSER_SELECTOR,
             };
         }
 
