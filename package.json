@@ -1,6 +1,6 @@
 {
   "name": "@muxiuesd/dsh-pixel-studio",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "在 DSH 里画像素画：三栏编辑器（左工具 / 中画布 / 右调色板），滚轮缩放，图层、调色板、导出 PNG 都在会话页签里。",
   "type": "module",
   "main": "./index.js",
