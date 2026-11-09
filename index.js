@@ -17,8 +17,14 @@ export const inject = ['webServer'];
 const API_PATH = '/dsh-pixel-studio';
 const HEADER = 'x-pixel-studio';
 const MAX_BODY = 8 * 1024 * 1024;
-const MAX_SIDE = 256;
-const MAX_COLORS = 64;
+const MAX_SIDE = 2048;
+// Slot alphabet: one character per palette slot (single UTF-16 unit each).
+// The leading 36 ascii characters keep every work saved before the 256 slot
+// palette pointing at the same colours; the rest are BMP private-use points.
+const BASE_CHARS = '0123456789abcdefghijklmnopqrstuvwxyz';
+const EXTRA_CHARS = Array.from({ length: 220 }, (_, offset) => String.fromCharCode(0xe000 + offset)).join('');
+const CHARS = BASE_CHARS + EXTRA_CHARS;
+const MAX_COLORS = CHARS.length;
 const MAX_LAYERS = 8;
 const MAX_EXPORT_PIXELS = 4096 * 4096;
 
@@ -129,7 +135,7 @@ function blankRows(width, height) {
 function cleanRows(value, width, height, paletteLength) {
     const rows = [];
     const source = Array.isArray(value) ? value : [];
-    const allowed = '0123456789abcdefghijklmnopqrstuvwxyz'.slice(0, paletteLength);
+    const allowed = CHARS.slice(0, paletteLength);
     for (let y = 0; y < height; y += 1) {
         const raw = typeof source[y] === 'string' ? source[y] : '';
         let row = '';
@@ -269,7 +275,7 @@ function renderRgba(work, scale) {
             for (let l = layers.length - 1; l >= 0; l -= 1) {
                 const row = layers[l].rows[y];
                 const ch = row === undefined ? '.' : row[x];
-                const index = ch === undefined || ch === '.' ? -1 : Number.parseInt(ch, 36);
+                const index = ch === undefined || ch === '.' ? -1 : CHARS.indexOf(ch);
                 if (Number.isInteger(index) && index >= 0 && index < rgb.length) {
                     color = rgb[index];
                     break;
@@ -584,6 +590,29 @@ async function handleRequest(ctx, req, res) {
             await fsp.mkdir(path.dirname(target), { recursive: true });
             await fsp.writeFile(target, png);
             sendJson(res, 200, { ok: true, path: target, width, height, bytes: png.length, overwritten: existed });
+            return;
+        }
+        if (op === 'exportPalette') {
+            // Writes a palette json the studio can read back (array of #rrggbb).
+            const colors = cleanPalette(payload.colors);
+            const rawTarget = typeof payload.path === 'string' ? payload.path.trim() : '';
+            if (rawTarget === '') {
+                sendJson(res, 400, { ok: false, error: 'invalid-path' });
+                return;
+            }
+            const name = cleanName(payload.name, '调色板');
+            const target = path.resolve(/\.json$/i.test(rawTarget) ? rawTarget : `${rawTarget}.json`);
+            let existed = false;
+            try {
+                await fsp.access(target);
+                existed = true;
+            } catch {
+                existed = false;
+            }
+            const body = JSON.stringify({ format: 'dsh-pixel-studio-palette', version: 1, name, colors }, null, 2);
+            await fsp.mkdir(path.dirname(target), { recursive: true });
+            await fsp.writeFile(target, body, 'utf8');
+            sendJson(res, 200, { ok: true, path: target, count: colors.length, overwritten: existed });
             return;
         }
         if (op === 'ping') {

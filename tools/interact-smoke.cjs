@@ -661,6 +661,18 @@ function loadModule() {
     check('width handles are handed back on unmount', clientSource.includes('restoreShellHandles(hiddenHandles)'));
     check('the sweep skips its own splitter nodes', clientSource.includes('root.contains(element)'));
     check('studio hides the shell composer seat', clientSource.includes('hideShellComposer(studioRoot, studioBody'));
+    check('the notice owns a flexible centre slot', clientSource.includes("className: 'pxs-bar-center'"));
+    check('the centre slot collapses before it overlaps', clientSource.includes('flex: 1 1 0; min-width: 0; overflow: hidden;'));
+    check('the bar wraps its controls for layout', clientSource.includes("className: 'pxs-bar-main'"));
+    check('the notice no longer floats over the buttons', !clientSource.includes('position: absolute; left: 50%'));
+
+    // 10b. the canvas side limit is raised to 2048 on both halves
+    const hostSource = fs.readFileSync(path.join(__dirname, '..', 'index.js'), 'utf8');
+    check('the studio raises the canvas side limit to 2048',
+        clientSource.includes('const MAX_SIDE = 2048;') && hostSource.includes('const MAX_SIDE = 2048;'));
+    check('the new-canvas dialog advertises the 2048 limit', clientSource.includes('最大 \${MAX_SIDE}'));
+    check('composing reuses a cached canvas', clientSource.includes('composeCacheRef'));
+    check('palette lookups go through a table, not a scan', clientSource.includes('CHAR_SLOTS'));
 
     // 11. composer + auto-fit toggles in the toolbar
     const hideToggle = byText('对话框隐藏', 'button')[0];
@@ -685,6 +697,100 @@ function loadModule() {
     check('the notice lives in a centred bar cluster', clientSource.includes("className: 'pxs-bar-center'")
         && clientSource.includes('.pxs-bar-center {'));
     check('the auto-fit preference is remembered', storage.get('pxs:autoFit') === '0', String(storage.get('pxs:autoFit')));
+
+    // 13. the palette panel offers a scroll box, JSON export and import
+    check('the swatch grid scrolls on demand', byClass('pxs-swatch-scroll').length === 1);
+    check('the palette panel counts towards the 256 colour limit',
+        clientSource.includes('${MAX_COLORS}') && clientSource.includes('const MAX_COLORS = CHARS.length;'));
+    check('the palette panel exports JSON', byText('⇩ 导出', 'button').length === 1);
+    check('the palette panel imports JSON', byText('⇧ 导入', 'button').length === 1);
+    check('the export reuses the save dialog in palette mode',
+        clientSource.includes("openSaveDialog('palette')") && clientSource.includes("mode === 'palette'"));
+    check('the save dialog titles the palette export', clientSource.includes('导出调色板 JSON'));
+    check('the palette import dialog offers replace and append',
+        clientSource.includes("applyPaletteImport('replace')") && clientSource.includes("applyPaletteImport('append')"));
+    check('the palette import reads json files', clientSource.includes("accept: '.json,.gpl,.pal,.txt,.hex,application/json,text/plain'"));
+    check('the new-work dialog can keep the current palette', clientSource.includes('沿用当前调色板'));
+    check('the import dialog can map onto the current palette', clientSource.includes('使用图片自己的调色板'));
+    check('an overridden import reports the current palette as its mode',
+        clientSource.includes("mode: dialog.overridePalette === false ? 'current' : dialog.mode"));
+    check('the colour chips follow the override checkbox',
+        clientSource.includes("importDialog.overridePalette === false && mode.id !== 'current'"));
+
+    // 14. picking a palette file really parses it and can replace the palette
+    const paletteInput = findAll((node) => node.type === 'input'
+        && node.props && typeof node.props.accept === 'string' && node.props.accept.includes('.json'))[0];
+    check('the palette picker is wired to the panel', Boolean(paletteInput));
+    const exportedJson = JSON.stringify({
+        format: 'dsh-pixel-studio-palette',
+        version: 1,
+        name: 'demo',
+        colors: ['#000000', '#1d2b53', '#7e2553'],
+    });
+    paletteInput.props.onChange(event({
+        target: { files: [{ name: 'demo.json', text: async () => exportedJson }] },
+    }));
+    await pump('palette import');
+    const importPanel = byClass('pxs-palette-import')[0];
+    check('the picked palette file is parsed and shown', Boolean(importPanel)
+        && textOf(importPanel).includes('demo.json · 3 个颜色'), importPanel ? textOf(importPanel) : 'missing panel');
+    const replaceButton = byText('覆盖', 'button')[0];
+    check('the import panel offers a replace button', Boolean(replaceButton));
+    replaceButton.props.onClick();
+    await pump('palette replace');
+    check('replacing the palette applies the picked colours',
+        Array.isArray(created.palette) && created.palette.join(',') === '#000000,#1d2b53,#7e2553',
+        JSON.stringify(created.palette));
+    check('the import panel closes once applied', byClass('pxs-palette-import').length === 0);
+
+    // 15. a new work reuses the current palette when the box stays ticked
+    const openNew = () => byText('新建', 'button')[0];
+    const newButton = openNew();
+    check('the toolbar offers 新建 once a work exists', Boolean(newButton));
+    newButton.props.onClick(event());
+    await pump('open-new-dialog-2');
+    const keepBox = findAll((node) => node.type === 'input' && node.props.type === 'checkbox')[0];
+    check('the new-work dialog ticks 沿用当前调色板 by default', Boolean(keepBox) && keepBox.props.checked === true,
+        keepBox && String(keepBox.props.checked));
+    byText('创建', 'button')[0].props.onClick(event());
+    await pump('create-doc-shared');
+    const sharedWork = state.docs[state.docs.length - 1];
+    check('a new work copies the current palette', Boolean(sharedWork)
+        && sharedWork.palette.join(',') === created.palette.join(','),
+        sharedWork && sharedWork.palette.join(','));
+
+    // 16. unticking falls back to the default 8 colours
+    openNew().props.onClick(event());
+    await pump('open-new-dialog-3');
+    const keepBox2 = findAll((node) => node.type === 'input' && node.props.type === 'checkbox')[0];
+    keepBox2.props.onChange(event({ target: { checked: false } }));
+    await pump('untick-keep-palette');
+    byText('创建', 'button')[0].props.onClick(event());
+    await pump('create-doc-default');
+    const defaultWork = state.docs[state.docs.length - 1];
+    check('unticking 沿用当前调色板 gives the default palette', Boolean(defaultWork) && defaultWork.palette.length === 8,
+        defaultWork && defaultWork.palette.length);
+
+    // 17. deleting a palette slot is undoable
+    fireKey('a', { ctrlKey: true });
+    await pump('select-all-delete');
+    byText('▣ 填充', 'button')[0].props.onClick(event());
+    await pump('fill-before-delete');
+    const paintedRows = defaultWork.layers[0].rows.slice();
+    check('the active work fills with the first colour',
+        paintedRows.every((row) => row === '0'.repeat(row.length)), paintedRows[0]);
+    byClass('pxs-swatch')[0].props.onDoubleClick();
+    await pump('edit-slot-before-delete');
+    byText('删除该色', 'button')[0].props.onClick(event());
+    await pump('delete-slot');
+    check('deleting a slot wipes the pixels that used it',
+        defaultWork.layers[0].rows.every((row) => /^\.+$/.test(row)), defaultWork.layers[0].rows[0]);
+    check('the palette shrinks by one', defaultWork.palette.length === 7, String(defaultWork.palette.length));
+    fireKey('z', { ctrlKey: true });
+    await pump('undo-slot-delete');
+    check('undo brings the slot and its pixels back', defaultWork.palette.length === 8
+        && JSON.stringify(defaultWork.layers[0].rows) === JSON.stringify(paintedRows),
+        `${defaultWork.palette.length} / ${defaultWork.layers[0].rows[0]}`);
 
     console.log(failures === 0 ? 'PASS: interaction flow works end to end' : `FAIL: ${failures} check(s) failed`);
     process.exit(failures === 0 ? 0 : 1);

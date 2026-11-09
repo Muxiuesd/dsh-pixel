@@ -42,7 +42,17 @@ window.__ModuleLoader__.load({
             const decimals = zoomValue >= 10 ? 0 : zoomValue >= 1 ? 1 : 3;
             return String(Number(zoomValue.toFixed(decimals)));
         }
-        const CHARS = '0123456789abcdefghijklmnopqrstuvwxyz';
+        // Slot alphabet: one character per palette slot. The first 36 are the
+        // original ascii digits/letters so works saved before the 256 colour
+        // palette keep pointing at the same slots; the rest are BMP private-use
+        // code points, each exactly one UTF-16 unit so row[x] stays a pixel.
+        const BASE_CHARS = '0123456789abcdefghijklmnopqrstuvwxyz';
+        const EXTRA_CHARS = Array.from({ length: 220 }, (_, offset) => String.fromCharCode(0xe000 + offset)).join('');
+        const CHARS = BASE_CHARS + EXTRA_CHARS;
+        // charCode → palette slot, so hot loops (compose, fill) do not scan CHARS.
+        const CHAR_SLOTS = new Int16Array(65536).fill(-1);
+        for (let slot = 0; slot < CHARS.length; slot += 1) CHAR_SLOTS[CHARS.charCodeAt(slot)] = slot;
+        const MAX_COLORS = CHARS.length;
         const HISTORY_LIMIT = 60;
         const MAX_LAYERS = 8;
 
@@ -92,7 +102,7 @@ window.__ModuleLoader__.load({
             { w: 64, h: 32, label: '64×32', hint: '横幅' },
         ];
         /** Keep in sync with MAX_SIDE in index.js. */
-        const MAX_SIDE = 256;
+        const MAX_SIDE = 2048;
         /** Keep in sync with MAX_EXPORT_PIXELS in index.js. */
         const MAX_EXPORT_PIXELS = 4096 * 4096;
         /** Magnifications offered by the Save-as dialog. */
@@ -151,8 +161,8 @@ window.__ModuleLoader__.load({
         }
 
         function indexFor(ch) {
-            const position = CHARS.indexOf(ch);
-            return position;
+            if (typeof ch !== 'string' || ch.length === 0) return -1;
+            return CHAR_SLOTS[ch.charCodeAt(0)];
         }
 
         function setPixel(rows, x, y, ch) {
@@ -419,6 +429,135 @@ window.__ModuleLoader__.load({
             const trimmed = typeof value === 'string' ? value.trim() : '';
             if (trimmed === '') return 'pixel-art.png';
             return /\.png$/i.test(trimmed) ? trimmed : `${trimmed}.png`;
+        }
+
+        function ensureJsonName(value) {
+            const trimmed = typeof value === 'string' ? value.trim() : '';
+            if (trimmed === '') return 'palette.json';
+            return /\.json$/i.test(trimmed) ? trimmed : `${trimmed}.json`;
+        }
+
+        /** Reads a palette json (a plain hex array or { colors: [...] }). */
+        /** Fold one palette entry into `#rrggbb`, or `null` when it is not a colour. */
+        function normalizePaletteColor(entry) {
+            if (typeof entry === 'number' && Number.isFinite(entry)) {
+                const value = Math.trunc(entry);
+                return value >= 0 && value <= 0xffffff ? `#${value.toString(16).padStart(6, '0')}` : null;
+            }
+            if (typeof entry !== 'string') return null;
+            const text = entry.trim().toLowerCase();
+            const long = /^#([0-9a-f]{6})(?:[0-9a-f]{2})?$/.exec(text)
+                || /^0x([0-9a-f]{6})$/.exec(text)
+                || /^([0-9a-f]{6})(?:[0-9a-f]{2})?$/.exec(text);
+            if (long) return `#${long[1]}`;
+            const short = /^#?([0-9a-f]{3})$/.exec(text);
+            if (short) return `#${short[1].split('').map((part) => part + part).join('')}`;
+            const rgb = /^rgba?\(\s*(\d{1,3})\s*,\s*(\d{1,3})\s*,\s*(\d{1,3})/.exec(text);
+            if (rgb) {
+                const bytes = rgb.slice(1).map((part) => Math.min(255, Number(part)).toString(16).padStart(2, '0'));
+                return `#${bytes.join('')}`;
+            }
+            return null;
+        }
+
+        /** Read "r g b" palette text (GIMP .gpl / JASC .pal share this shape). */
+        function parseRgbPaletteText(text, emptyMessage) {
+            const colors = [];
+            for (const line of text.split(/\r?\n/)) {
+                if (/^\s*(?:[#;]|GIMP\s+Palette|Name:|Columns:|JASC-PAL)/i.test(line)) continue;
+                if (/^\s*\d+\s*$/.test(line)) continue;
+                const match = /^\s*(\d{1,3})\s+(\d{1,3})\s+(\d{1,3})(?:\s|$)/.exec(line);
+                if (!match) continue;
+                const color = normalizePaletteColor(`rgb(${match[1]},${match[2]},${match[3]})`);
+                if (!color || colors.indexOf(color) >= 0) continue;
+                if (colors.length >= MAX_COLORS) break;
+                colors.push(color);
+            }
+            if (colors.length === 0) throw new Error(emptyMessage);
+            return colors;
+        }
+
+        /** Accept a palette file written by this plugin, by hand, or by a paint app. */
+        function parsePaletteDocument(text) {
+            if (typeof text !== 'string' || text.trim() === '') throw new Error('文件是空的');
+            const raw = text.replace(/^\uFEFF/, '').trim();
+            const head = raw.slice(0, 8);
+            const looksBinary = head.includes('\uFFFD')
+                || /^\uFFFD?PNG/.test(head)
+                || /^(GIF8|RIFF|BM|\u0000\u0000\u0001\u0000)/.test(head)
+                || (raw.indexOf('\u0000') >= 0 && raw.indexOf('#') < 0);
+            if (looksBinary) {
+                throw new Error('这是图片文件（或二进制文件），不是调色板：请选择 .json / .gpl / .pal 或含 #rrggbb 的文本文件');
+            }
+            if (/^JASC-PAL/i.test(raw)) return parseRgbPaletteText(raw, '这个 .pal 文件里没有颜色');
+            if (/^GIMP Palette/i.test(raw)) return parseRgbPaletteText(raw, '这个 .gpl 文件里没有颜色');
+            let parsed = null;
+            let broken = false;
+            try {
+                parsed = JSON.parse(raw);
+            } catch {
+                broken = true;
+            }
+            if (!broken) {
+                const wrapped = parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+                    ? [parsed.colors, parsed.palette, parsed.entries].find((value) => Array.isArray(value) || (value !== null && typeof value === 'object'))
+                    : null;
+                const source = Array.isArray(parsed) ? parsed : wrapped || null;
+                if (source === null) throw new Error('缺少 colors 数组');
+                const entries = Array.isArray(source) ? source : Object.values(source);
+                const colors = [];
+                for (const entry of entries) {
+                    const color = normalizePaletteColor(entry);
+                    if (!color || colors.indexOf(color) >= 0) continue;
+                    if (colors.length >= MAX_COLORS) break;
+                    colors.push(color);
+                }
+                if (colors.length > 0) return colors;
+                throw new Error('文件里没有找到颜色（支持 #rrggbb、#rgb、rgb(r,g,b)）');
+            }
+            const scraped = [];
+            for (const match of raw.matchAll(/#[0-9a-fA-F]{6}\b|#[0-9a-fA-F]{3}\b/g)) {
+                const color = normalizePaletteColor(match[0]);
+                if (!color || scraped.indexOf(color) >= 0) continue;
+                if (scraped.length >= MAX_COLORS) break;
+                scraped.push(color);
+            }
+            if (scraped.length > 0) return scraped;
+            throw new Error(`不是有效的 JSON 文件（支持 JSON、.gpl、.pal），文件开头是「${raw.slice(0, 16)}」`);
+        }
+
+        /** Append `incoming` colours to `current`, dropping whatever exceeds the cap. */
+        function mergePalettes(current, incoming, limit) {
+            const cap = Number.isFinite(limit) && limit > 0 ? limit : MAX_COLORS;
+            const palette = Array.isArray(current) ? current.slice(0, cap) : [];
+            let added = 0;
+            let skipped = 0;
+            for (const color of Array.isArray(incoming) ? incoming : []) {
+                if (palette.indexOf(color) >= 0) continue;
+                if (palette.length >= cap) {
+                    skipped += 1;
+                    continue;
+                }
+                palette.push(color);
+                added += 1;
+            }
+            return { palette, added, skipped };
+        }
+
+        /** Drop pixel slots that a shrunk palette can no longer address. */
+        function trimRowsToPalette(layers, count) {
+            const limit = Number.isFinite(count) && count > 0 ? count : 0;
+            return (Array.isArray(layers) ? layers : []).map((layer) => ({
+                ...layer,
+                rows: (Array.isArray(layer.rows) ? layer.rows : []).map((row) => {
+                    let out = '';
+                    for (let x = 0; x < row.length; x += 1) {
+                        const slot = indexFor(row[x]);
+                        out += slot >= 0 && slot < limit ? row[x] : '.';
+                    }
+                    return out;
+                }),
+            }));
         }
 
         /* ------------------------------------------------------------------ */
@@ -946,7 +1085,7 @@ window.__ModuleLoader__.load({
             let palette;
             let rgb;
             let note = '';
-            if (dialog.mode === 'current' && Array.isArray(currentPalette) && currentPalette.length > 0) {
+            if ((dialog.mode === 'current' || dialog.overridePalette === false) && Array.isArray(currentPalette) && currentPalette.length > 0) {
                 palette = currentPalette.slice(0, IMPORT_MAX_COLORS);
                 rgb = palette.map(hexToRgb).map(rgbOf);
             } else if (dialog.mode === 'pico8') {
@@ -967,6 +1106,10 @@ window.__ModuleLoader__.load({
             const rows = buildImportRows(sample, rgb, dialog.dither === true);
             return {
                 ...dialog,
+                // Mapping onto the current palette overrides the 配色 chips, so the
+                // chip row must show what actually happened.
+                mode: dialog.overridePalette === false ? 'current' : dialog.mode,
+                overridePalette: dialog.overridePalette !== false,
                 palette,
                 rows,
                 note,
@@ -1045,12 +1188,15 @@ window.__ModuleLoader__.load({
   border-bottom: 1px solid var(--dsw-alias-border-l1, rgba(255,255,255,.1));
   background: var(--dsw-alias-bg-layer-1, #1c1f26);
 }
-.pxs-bar-center {
-  position: absolute; left: 50%; top: 0; bottom: 0; transform: translateX(-50%);
-  display: flex; align-items: center; justify-content: center; gap: 10px;
-  max-width: 46%; min-width: 0; overflow: hidden; pointer-events: none;
+.pxs-bar-main {
+  display: flex; align-items: center; gap: 6px; min-width: 0;
+  flex: 0 1 auto; overflow: hidden;
 }
-.pxs-bar-center .pxs-notice { max-width: 100%; pointer-events: auto; }
+.pxs-bar-center {
+  flex: 1 1 0; min-width: 0; overflow: hidden;
+  display: flex; align-items: center; justify-content: center; gap: 10px;
+}
+.pxs-bar-center .pxs-notice { max-width: 100%; min-width: 0; }
 .pxs-main {
   flex: 1 1 auto; min-height: 0; display: grid; overflow: hidden;
   grid-template-columns:
@@ -1117,6 +1263,8 @@ window.__ModuleLoader__.load({
   color: var(--dsw-alias-label-secondary, #9aa1ad);
 }
 .pxs-row { display: flex; flex-wrap: wrap; gap: 4px; }
+        .pxs-check { display: flex; align-items: center; gap: 6px; cursor: pointer; font-size: 12px; }
+        .pxs-check input { width: 13px; height: 13px; margin: 0; cursor: pointer; }
 .pxs-btn {
   appearance: none; cursor: pointer; border-radius: 6px; padding: 0 8px; height: 26px;
   display: inline-flex; align-items: center; justify-content: center; gap: 4px;
@@ -1138,6 +1286,14 @@ window.__ModuleLoader__.load({
 .pxs-input:focus { outline: 1px solid var(--dsw-alias-brand-primary, #4c8dff); outline-offset: 0; }
 .pxs-spacer { flex: 1 1 auto; }
 .pxs-swatches { display: grid; grid-template-columns: repeat(auto-fill, minmax(35px, 1fr)); gap: 4px; }
+.pxs-swatch-scroll { max-height: 232px; overflow-y: auto; overflow-x: hidden; overscroll-behavior: contain; scrollbar-width: thin; padding-right: 2px; }
+.pxs-swatch-scroll::-webkit-scrollbar { width: 8px; height: 8px; }
+.pxs-swatch-scroll::-webkit-scrollbar-thumb { background: rgba(140, 148, 160, 0.55); border-radius: 4px; }
+.pxs-swatch-scroll::-webkit-scrollbar-thumb:hover { background: rgba(140, 148, 160, 0.85); }
+.pxs-swatch-scroll::-webkit-scrollbar-track { background: transparent; }
+.pxs-palette-tools { display: flex; gap: 6px; margin-top: 6px; }
+.pxs-palette-tools .pxs-btn { flex: 1 1 0; padding: 3px 6px; font-size: 11px; }
+.pxs-palette-import { border: 1px solid var(--dsw-alias-border-l1, rgba(128, 128, 128, 0.35)); border-radius: 8px; padding: 8px; }
 .pxs-swatch {
   aspect-ratio: 1; border-radius: 5px; cursor: pointer; padding: 0; border: 1px solid rgba(0,0,0,.35);
   position: relative;
@@ -1720,6 +1876,7 @@ window.__ModuleLoader__.load({
              */
             const [draftColor, setDraftColor] = useState(null);
             const [importDialog, setImportDialog] = useState(null);
+            const [paletteImport, setPaletteImport] = useState(null);
             const [resizeDialog, setResizeDialog] = useState(null);
             const [selection, setSelection] = useState(null);
             const [grabMode, setGrabMode] = useState(false);
@@ -1764,6 +1921,7 @@ window.__ModuleLoader__.load({
             const draftEditRef = useRef(null);
             const hexInputRef = useRef(null);
             const nativeColorRef = useRef(null);
+            const paletteInputRef = useRef(null);
             const frameRef = useRef(0);
             const mainRef = useRef(null);
             const gridRef = useRef(true);
@@ -1810,6 +1968,11 @@ window.__ModuleLoader__.load({
             /* painting                                                       */
             /* -------------------------------------------------------------- */
 
+            // Large canvases (up to 2048×2048) would otherwise rebuild a 16 MB image on
+            // every pan/zoom frame, so remember the last composed document and reuse the
+            // pixel buffer. Documents are updated immutably, so identity is a safe key.
+            const composeCacheRef = useRef({ doc: null, image: null });
+
             const composeImage = useCallback(() => {
                 const current = docRef.current;
                 if (!current) return null;
@@ -1818,19 +1981,28 @@ window.__ModuleLoader__.load({
                     off = document.createElement('canvas');
                     offRef.current = off;
                 }
+                const cache = composeCacheRef.current;
                 if (off.width !== current.w || off.height !== current.h) {
                     off.width = current.w;
                     off.height = current.h;
+                    cache.image = null;
+                    cache.doc = null;
                 }
+                if (cache.doc === current && cache.image) return off;
                 const context = off.getContext('2d');
                 if (!context) return null;
-                const image = context.createImageData(current.w, current.h);
-                const rgb = current.palette.map(hexToRgb);
-                const paletteRgb = rgb.map(([r, g, b]) => [r, g, b]);
+                let image = cache.image;
+                if (!image || image.width !== current.w || image.height !== current.h) {
+                    image = context.createImageData(current.w, current.h);
+                }
+                const data = image.data;
+                const paletteRgb = current.palette.map(hexToRgb);
+                const layerCount = current.layers.length;
                 for (let y = 0; y < current.h; y += 1) {
+                    const rowOffset = y * current.w;
                     for (let x = 0; x < current.w; x += 1) {
                         let color = null;
-                        for (let l = current.layers.length - 1; l >= 0; l -= 1) {
+                        for (let l = layerCount - 1; l >= 0; l -= 1) {
                             const layer = current.layers[l];
                             if (layer.visible === false) continue;
                             const row = layer.rows[y];
@@ -1841,18 +2013,20 @@ window.__ModuleLoader__.load({
                                 break;
                             }
                         }
-                        const offset = (y * current.w + x) * 4;
+                        const offset = (rowOffset + x) * 4;
                         if (color === null) {
-                            image.data[offset + 3] = 0;
+                            data[offset + 3] = 0;
                         } else {
-                            image.data[offset] = color[0];
-                            image.data[offset + 1] = color[1];
-                            image.data[offset + 2] = color[2];
-                            image.data[offset + 3] = 255;
+                            data[offset] = color[0];
+                            data[offset + 1] = color[1];
+                            data[offset + 2] = color[2];
+                            data[offset + 3] = 255;
                         }
                     }
                 }
                 context.putImageData(image, 0, 0);
+                cache.doc = current;
+                cache.image = image;
                 return off;
             }, []);
 
@@ -1894,10 +2068,14 @@ window.__ModuleLoader__.load({
                 context.fillStyle = dark;
                 context.fillRect(pan.x, pan.y, docWidth, docHeight);
                 context.fillStyle = light;
-                const startX = Math.floor(pan.x / cell) * cell;
-                const startY = Math.floor(pan.y / cell) * cell;
-                for (let y = startY; y < pan.y + docHeight; y += cell) {
-                    for (let x = startX; x < pan.x + docWidth; x += cell) {
+                // Only paint the squares that are actually on screen: a 2048px artwork
+                // zoomed to 4× is 8192px wide and would otherwise fill a million rects.
+                const startX = Math.floor(Math.max(pan.x, 0) / cell) * cell;
+                const startY = Math.floor(Math.max(pan.y, 0) / cell) * cell;
+                const endX = Math.min(pan.x + docWidth, width);
+                const endY = Math.min(pan.y + docHeight, height);
+                for (let y = startY; y < endY; y += cell) {
+                    for (let x = startX; x < endX; x += cell) {
                         if (((x / cell) + (y / cell)) % 2 === 0) continue;
                         context.fillRect(x, y, cell, cell);
                     }
@@ -1921,13 +2099,18 @@ window.__ModuleLoader__.load({
                     context.clip();
                     context.strokeStyle = 'rgba(255,255,255,0.09)';
                     context.lineWidth = 1;
+                    // Skip grid lines that sit outside the visible stage.
+                    const firstCol = Math.max(1, Math.floor((0 - pan.x) / scale));
+                    const lastCol = Math.min(current.w, Math.ceil((width - pan.x) / scale) + 1);
+                    const firstRow = Math.max(1, Math.floor((0 - pan.y) / scale));
+                    const lastRow = Math.min(current.h, Math.ceil((height - pan.y) / scale) + 1);
                     context.beginPath();
-                    for (let x = 1; x < current.w; x += 1) {
+                    for (let x = firstCol; x < lastCol; x += 1) {
                         const px = Math.round(pan.x + x * scale) + 0.5;
                         context.moveTo(px, pan.y);
                         context.lineTo(px, pan.y + docHeight);
                     }
-                    for (let y = 1; y < current.h; y += 1) {
+                    for (let y = firstRow; y < lastRow; y += 1) {
                         const py = Math.round(pan.y + y * scale) + 0.5;
                         context.moveTo(pan.x, py);
                         context.lineTo(pan.x + docWidth, py);
@@ -1936,7 +2119,7 @@ window.__ModuleLoader__.load({
                     context.restore();
                 }
 
-                if (selection) {
+                if (selection && toolRef.current === 'select') {
                     const boxX = Math.round(pan.x + selection.x * scale);
                     const boxY = Math.round(pan.y + selection.y * scale);
                     const boxW = Math.max(1, Math.round(selection.w * scale));
@@ -2178,6 +2361,11 @@ window.__ModuleLoader__.load({
                 }
                 docRef.current = next;
                 setDoc(next);
+                if (colorRef.current > next.palette.length - 1) {
+                    const safeSlot = Math.max(0, next.palette.length - 1);
+                    colorRef.current = safeSlot;
+                    setColorIndex(safeSlot);
+                }
                 if (!next.layers[layerRef.current]) {
                     const safe = Math.max(0, next.layers.length - 1);
                     layerRef.current = safe;
@@ -2331,6 +2519,17 @@ window.__ModuleLoader__.load({
                 }
                 requestPaint();
             }, [putBackLifted, requestPaint, scheduleSave]);
+
+            /**
+             * Ends a selection (and drops any lifted pixels back) because the user reached
+             * for something else: another tool, another colour, a layer, a dialog. The
+             * marching ants must never survive a mode change.
+             */
+            const interruptSelection = useCallback(() => {
+                if (!selectionRef.current && !selectDragRef.current) return;
+                selectDragRef.current = null;
+                cancelSelection();
+            }, [cancelSelection]);
 
             /** Lifts the selected pixels out of their layers; false when nothing could be lifted. */
             const liftSelection = useCallback((allLayers) => {
@@ -2535,6 +2734,22 @@ window.__ModuleLoader__.load({
                 allLayers: allLayersRef.current,
             };
 
+            // Reaching for anything that is not the selection ends it, so its outline can
+            // never be left behind over the artwork.
+            useEffect(() => {
+                if (tool === 'select') return;
+                interruptSelection();
+            }, [interruptSelection, tool]);
+
+            useEffect(() => {
+                interruptSelection();
+            }, [brush, colorIndex, interruptSelection, layerIndex]);
+
+            useEffect(() => {
+                if (!editing && !newDialog && !importDialog && !saveDialog && !paletteImport) return;
+                interruptSelection();
+            }, [editing, importDialog, interruptSelection, newDialog, paletteImport, saveDialog]);
+
             const onPointerDown = useCallback((event) => {
                 if (!docRef.current) return;
                 const wantsPan = event.button === 1 || spaceRef.current || event.altKey;
@@ -2556,6 +2771,11 @@ window.__ModuleLoader__.load({
                 const current = docRef.current;
 
                 if (toolRef.current === 'select') {
+                    if (cell.x < 0 || cell.y < 0 || cell.x >= current.w || cell.y >= current.h) {
+                        // Beside the artwork there is nothing to select: end the old one.
+                        interruptSelection();
+                        return;
+                    }
                     event.preventDefault();
                     const anchor = {
                         x: clamp(cell.x, 0, Math.max(0, current.w - 1)),
@@ -2621,7 +2841,7 @@ window.__ModuleLoader__.load({
                 strokeRef.current = { pointerId: event.pointerId, last: cell };
                 event.currentTarget.setPointerCapture(event.pointerId);
                 strokeAt(cell, null);
-            }, [cellFromEvent, commitRows, pickColorAt, requestPaint, strokeAt]);
+            }, [cellFromEvent, commitRows, interruptSelection, pickColorAt, requestPaint, strokeAt]);
 
             const onPointerMove = useCallback((event) => {
                 const panDraw = panDrawRef.current;
@@ -2666,6 +2886,11 @@ window.__ModuleLoader__.load({
                 if (!stroke || stroke.pointerId !== event.pointerId) return;
                 const cell = cellFromEvent(event);
                 if (!cell) return;
+                const strokeDoc = docRef.current;
+                if (!strokeDoc || cell.x < 0 || cell.y < 0 || cell.x >= strokeDoc.w || cell.y >= strokeDoc.h) {
+                    // The pointer left the artwork: paint nothing instead of smearing the edge.
+                    return;
+                }
                 if (stroke.last && stroke.last.x === cell.x && stroke.last.y === cell.y) return;
                 strokeAt(cell, stroke.last);
                 stroke.last = cell;
@@ -3078,7 +3303,9 @@ window.__ModuleLoader__.load({
                         name,
                         w: width,
                         h: height,
-                        palette: PRESETS[0].colors.slice(0, 8),
+                        palette: Array.isArray(options.palette) && options.palette.length > 0
+                            ? options.palette.slice(0, MAX_COLORS)
+                            : PRESETS[0].colors.slice(0, 8),
                     });
                     setDoc(data.doc);
                     docRef.current = data.doc;
@@ -3104,7 +3331,7 @@ window.__ModuleLoader__.load({
             /** New-work dialog: name + size, with presets one click away. */
             const openNewDialog = useCallback(() => {
                 const base = docs.length + 1;
-                setNewDialog({ name: `作品 ${base}`, w: 32, h: 32, error: '' });
+                setNewDialog({ name: `作品 ${base}`, w: 32, h: 32, keepPalette: true, error: '' });
             }, [docs.length]);
 
             const confirmNewDoc = useCallback(() => {
@@ -3120,7 +3347,13 @@ window.__ModuleLoader__.load({
                     setNewDialog({ ...dialog, error: `最大 ${MAX_SIDE}×${MAX_SIDE}` });
                     return;
                 }
-                void createDoc({ name: dialog.name, w: width, h: height });
+                const shared = docRef.current && Array.isArray(docRef.current.palette) ? docRef.current.palette : null;
+                void createDoc({
+                    name: dialog.name,
+                    w: width,
+                    h: height,
+                    palette: dialog.keepPalette !== false && shared && shared.length > 0 ? shared : null,
+                });
             }, [createDoc, newDialog]);
 
             const deleteDoc = useCallback(async () => {
@@ -3167,7 +3400,12 @@ window.__ModuleLoader__.load({
                 if (!current) return;
                 const filePath = typeof current.filePath === 'string' ? current.filePath : '';
                 const startDir = mode === 'saveAs' ? dirNameOf(filePath) : '';
-                const name = mode === 'saveAs' && filePath !== '' ? baseNameOf(filePath) : ensurePngName(current.name);
+                const stem = filePath !== '' ? baseNameOf(filePath).replace(/\.png$/i, '') : current.name;
+                const name = mode === 'palette'
+                    ? ensureJsonName(`${stem} 调色板`)
+                    : mode === 'saveAs' && filePath !== ''
+                        ? baseNameOf(filePath)
+                        : ensurePngName(current.name);
                 setSaveDialog({
                     mode,
                     path: '',
@@ -3189,6 +3427,24 @@ window.__ModuleLoader__.load({
                 const dialog = saveDialog;
                 if (!current || !dialog || dialog.busy) return;
                 if (typeof dialog.path !== 'string' || dialog.path === '') return;
+                if (dialog.mode === 'palette') {
+                    setSaveDialog((value) => (value ? { ...value, busy: true, error: '' } : value));
+                    try {
+                        const saved = await callApi({
+                            op: 'exportPalette',
+                            path: joinPath(dialog.path, ensureJsonName(dialog.name)),
+                            name: current.name,
+                            colors: current.palette,
+                        });
+                        setSaveDialog(null);
+                        setError('');
+                        setNotice(`已导出 ${saved.count} 个颜色到 ${saved.path}`);
+                    } catch (cause) {
+                        const message = cause instanceof Error ? cause.message : String(cause);
+                        setSaveDialog((value) => (value ? { ...value, busy: false, error: message } : value));
+                    }
+                    return;
+                }
                 const target = joinPath(dialog.path, ensurePngName(dialog.name));
                 const scale = clampExportScale(dialog.scale, current.w, current.h);
                 setSaveDialog((value) => (value ? { ...value, busy: true, error: '' } : value));
@@ -3373,6 +3629,77 @@ window.__ModuleLoader__.load({
             /* palette actions                                                */
             /* -------------------------------------------------------------- */
 
+            const openPalettePicker = useCallback(() => {
+                const input = paletteInputRef.current;
+                if (!input) return;
+                input.value = '';
+                input.click();
+            }, []);
+
+            const onPaletteFile = useCallback(async (event) => {
+                const input = event && event.target;
+                const picked = input && input.files ? input.files[0] : null;
+                if (!picked) return;
+                try {
+                    const raw = typeof picked.text === 'function'
+                        ? await picked.text()
+                        : await new Promise((resolve, reject) => {
+                            const reader = new FileReader();
+                            reader.onload = () => resolve(String(reader.result || ''));
+                            reader.onerror = () => reject(new Error('读取文件失败，请重试'));
+                            reader.readAsText(picked);
+                        });
+                    const colors = parsePaletteDocument(raw);
+                    setPaletteImport({ fileName: picked.name, colors, error: '' });
+                } catch (cause) {
+                    const message = cause instanceof Error ? cause.message : String(cause);
+                    setPaletteImport({ fileName: picked.name, colors: [], error: message });
+                }
+            }, []);
+
+            const applyPaletteImport = useCallback((mode) => {
+                const current = docRef.current;
+                const pending = paletteImport;
+                if (!current || !pending) return;
+                const incoming = Array.isArray(pending.colors) ? pending.colors : [];
+                if (incoming.length === 0) return;
+                pushHistory();
+                if (mode === 'replace') {
+                    const palette = incoming.slice(0, MAX_COLORS);
+                    const next = {
+                        ...current,
+                        palette,
+                        layers: trimRowsToPalette(current.layers, palette.length),
+                    };
+                    docRef.current = next;
+                    setDoc(next);
+                    const slot = clamp(Math.min(colorRef.current, palette.length - 1), 0, palette.length - 1);
+                    colorRef.current = slot;
+                    setColorIndex(slot);
+                    editSessionRef.current = null;
+                    draftEditRef.current = null;
+                    setDraftColor(null);
+                    setEditing(null);
+                    setPaletteImport(null);
+                    requestPaint();
+                    scheduleSave();
+                    setNotice(palette.length < current.palette.length
+                        ? `调色板已替换为 ${palette.length} 个颜色，超出新调色板的像素已清空（可撤销）`
+                        : `调色板已替换为 ${palette.length} 个颜色`);
+                    return;
+                }
+                const merged = mergePalettes(current.palette, incoming, MAX_COLORS);
+                const next = { ...current, palette: merged.palette };
+                docRef.current = next;
+                setDoc(next);
+                setPaletteImport(null);
+                requestPaint();
+                scheduleSave();
+                setNotice(merged.skipped > 0
+                    ? `已追加 ${merged.added} 个颜色，${merged.skipped} 个超出 ${MAX_COLORS} 色上限未导入`
+                    : `已追加 ${merged.added} 个颜色`);
+            }, [paletteImport, pushHistory, requestPaint, scheduleSave]);
+
             const updatePalette = useCallback((palette, options = {}) => {
                 const current = docRef.current;
                 if (!current) return;
@@ -3547,6 +3874,8 @@ window.__ModuleLoader__.load({
             const removeColor = useCallback((index) => {
                 const current = docRef.current;
                 if (!current || current.palette.length <= 1) return;
+                // Deleting a slot wipes every pixel that used it, so it must be undoable.
+                pushHistory();
                 const palette = current.palette.slice();
                 palette.splice(index, 1);
                 // Pixels that used the removed slot become transparent.
@@ -3581,7 +3910,8 @@ window.__ModuleLoader__.load({
                 }
                 requestPaint();
                 scheduleSave();
-            }, [requestPaint, scheduleSave]);
+                setNotice('已删除该颜色，画布上用到它的像素已清空（可撤销）');
+            }, [pushHistory, requestPaint, scheduleSave]);
 
             /**
              * Presets only ever *add* colors. Existing slots keep their index, so every
@@ -3842,6 +4172,7 @@ window.__ModuleLoader__.load({
             })) : [];
 
             const barNode = h('div', { className: 'pxs-bar' },
+                h('div', { className: 'pxs-bar-main' },
                 h('select', {
                     className: 'pxs-input',
                     style: { maxWidth: 168 },
@@ -3992,9 +4323,9 @@ window.__ModuleLoader__.load({
                     title: '删除当前作品',
                 }, '删除'),
                 h('span', { className: 'pxs-status', 'data-state': status }, statusText),
-                selection ? h('span', { className: 'pxs-status pxs-select-status', title: '选区：拖动移框，Shift+拖动带内容，方向键微调，Esc 取消' }, selectionText) : null,
-                notice ? h('div', { className: 'pxs-bar-center' },
-                    h('span', { className: 'pxs-notice', title: notice }, notice)) : null);
+                selection ? h('span', { className: 'pxs-status pxs-select-status', title: '选区：拖动移框，Shift+拖动带内容，方向键微调，Esc 取消' }, selectionText) : null),
+                h('div', { className: 'pxs-bar-center' },
+                    notice ? h('span', { className: 'pxs-notice', title: notice }, notice) : null));
 
             const errorNode = error ? h('div', { className: 'pxs-error' },
                 `${error}`,
@@ -4251,17 +4582,60 @@ window.__ModuleLoader__.load({
                         h('div', { className: 'pxs-hint' }, `色板 #${colorIndex}`))));
 
             const paletteSection = h('div', { className: 'pxs-section' },
-                h('p', { className: 'pxs-title' }, '调色板'),
-                h('div', { className: 'pxs-swatches' },
-                    swatchNodes,
+                h('p', { className: 'pxs-title' }, `调色板（${doc ? doc.palette.length : 0}/${MAX_COLORS}）`),
+                h('div', { className: 'pxs-swatch-scroll' },
+                    h('div', { className: 'pxs-swatches' },
+                        swatchNodes,
+                        h('button', {
+                            className: 'pxs-swatch-add',
+                            title: '添加颜色',
+                            disabled: !doc,
+                            onPointerDown: (event) => event.stopPropagation(),
+                            onClick: addColor,
+                        }, '+'))),
+                h('div', { className: 'pxs-palette-tools' },
                     h('button', {
-                        className: 'pxs-swatch-add',
-                        title: '添加颜色',
+                        className: 'pxs-btn',
                         disabled: !doc,
-                        onPointerDown: (event) => event.stopPropagation(),
-                        onClick: addColor,
-                    }, '+')),
+                        title: '把当前调色板导出成 json 文件',
+                        onClick: () => { void openSaveDialog('palette'); },
+                    }, '⇩ 导出'),
+                    h('button', {
+                        className: 'pxs-btn',
+                        disabled: !doc,
+                        title: '读取 json 调色板文件，可选择覆盖或追加',
+                        onClick: openPalettePicker,
+                    }, '⇧ 导入'),
+                    h('input', {
+                        ref: paletteInputRef,
+                        type: 'file',
+                        accept: '.json,.gpl,.pal,.txt,.hex,application/json,text/plain',
+                        style: { display: 'none' },
+                        onChange: onPaletteFile,
+                    })),
                 h('p', { className: 'pxs-hint', style: { marginTop: 6 } }, '点选颜色 · 双击改色 · 右键更多'));
+
+            const paletteImportNode = paletteImport ? h('div', { className: 'pxs-section pxs-palette-import' },
+                h('p', { className: 'pxs-title' }, '导入调色板'),
+                h('p', { className: 'pxs-hint' },
+                    paletteImport.error !== ''
+                        ? paletteImport.error
+                        : `${paletteImport.fileName} · ${paletteImport.colors.length} 个颜色`),
+                h('p', { className: 'pxs-hint' }, '支持本插件导出的 .json，以及 .gpl / .pal / 任意含 #rrggbb 的文本。'),
+                h('div', { className: 'pxs-row' },
+                    h('button', {
+                        className: 'pxs-btn pxs-btn-primary',
+                        disabled: paletteImport.error !== '',
+                        title: '用文件里的颜色替换当前调色板；超出新长度的像素会变透明',
+                        onClick: () => applyPaletteImport('replace'),
+                    }, '覆盖'),
+                    h('button', {
+                        className: 'pxs-btn',
+                        disabled: paletteImport.error !== '',
+                        title: `追加到当前调色板后面（上限 ${MAX_COLORS} 色）`,
+                        onClick: () => applyPaletteImport('append'),
+                    }, '追加'),
+                    h('button', { className: 'pxs-btn', onClick: () => setPaletteImport(null) }, '取消'))) : null;
 
             const presetSection = h('div', { className: 'pxs-section' },
                 h('p', { className: 'pxs-title' }, '预设色板'),
@@ -4375,7 +4749,7 @@ window.__ModuleLoader__.load({
                     }, '删除该色')));
 
             const rightPanel = h('div', { className: 'pxs-panel pxs-panel-right' },
-                colorSection, paletteSection, colorEditNode, presetSection);
+                colorSection, paletteSection, paletteImportNode, colorEditNode, presetSection);
 
             const menuNode = menu ? h('div', {
                 className: 'pxs-menu',
@@ -4414,7 +4788,9 @@ window.__ModuleLoader__.load({
             },
             h('div', { className: 'pxs-dialog', role: 'dialog', 'aria-label': '保存 PNG' },
                 h('div', { className: 'pxs-dialog-head' },
-                    h('strong', null, saveDialog.mode === 'saveAs' ? '另存为 PNG' : '选择保存位置'),
+                    h('strong', null, saveDialog.mode === 'palette'
+                        ? '导出调色板 JSON'
+                        : (saveDialog.mode === 'saveAs' ? '另存为 PNG' : '选择保存位置')),
                     h('button', { className: 'pxs-dialog-close', onClick: () => setSaveDialog(null) }, '×')),
                 h('div', { className: 'pxs-dialog-row' },
                     h('button', {
@@ -4477,7 +4853,7 @@ window.__ModuleLoader__.load({
                             }
                         },
                     })),
-                h('div', { className: 'pxs-dialog-row', style: { flexWrap: 'wrap' } },
+                saveDialog.mode === 'palette' ? null : h('div', { className: 'pxs-dialog-row', style: { flexWrap: 'wrap' } },
                     h('span', { className: 'pxs-dialog-label' }, '倍率'),
                     EXPORT_SCALES.map((value) => {
                         const ceiling = maxScaleFor(doc ? doc.w : 1, doc ? doc.h : 1);
@@ -4577,6 +4953,17 @@ window.__ModuleLoader__.load({
                     },
                     h('span', { className: 'pxs-size-label' }, preset.label),
                     h('span', { className: 'pxs-size-hint' }, preset.hint)))),
+                h('div', { className: 'pxs-dialog-row' },
+                    h('label', { className: 'pxs-check', title: '取消勾选则新建作品使用默认 8 色调色板' },
+                        h('input', {
+                            type: 'checkbox',
+                            checked: newDialog.keepPalette !== false,
+                            onChange: (event) => {
+                                const next = event.target.checked !== false;
+                                setNewDialog((current) => (current ? { ...current, keepPalette: next } : current));
+                            },
+                        }),
+                        h('span', null, '沿用当前调色板'))),
                 newDialog.error ? h('div', { className: 'pxs-dialog-error' }, newDialog.error) : null,
                 h('div', { className: 'pxs-dialog-actions' },
                     h('button', {
@@ -4632,7 +5019,11 @@ window.__ModuleLoader__.load({
                         key: mode.id,
                         className: 'pxs-scale-chip',
                         'data-active': importDialog.mode === mode.id ? 'true' : 'false',
-                        disabled: mode.disabled === true || importDialog.busy,
+                        disabled: mode.disabled === true || importDialog.busy
+                            || (importDialog.overridePalette === false && mode.id !== 'current'),
+                        title: importDialog.overridePalette === false
+                            ? '已选择映射到当前调色板：勾选「使用图片自己的调色板」后才能改配色'
+                            : undefined,
                         onClick: () => retuneImport({ mode: mode.id }),
                     }, mode.label)),
                     h('button', {
@@ -4642,6 +5033,18 @@ window.__ModuleLoader__.load({
                         title: '误差扩散抖动，渐变更自然但像素更碎',
                         onClick: () => retuneImport({ dither: !importDialog.dither }),
                     }, '抖动')),
+                h('div', { className: 'pxs-dialog-row' },
+                    h('label', { className: 'pxs-check', title: '取消勾选则把图片颜色映射到当前调色板' },
+                        h('input', {
+                            type: 'checkbox',
+                            checked: importDialog.overridePalette !== false,
+                            disabled: importDialog.busy,
+                            onChange: (event) => {
+                                const next = event.target.checked !== false;
+                                retuneImport({ overridePalette: next });
+                            },
+                        }),
+                        h('span', null, '使用图片自己的调色板'))),
                 importDialog.preview
                     ? h('div', { className: 'pxs-import-preview' },
                         h('img', { src: importDialog.preview, alt: '导入预览' }))
@@ -4842,6 +5245,10 @@ window.__ModuleLoader__.load({
                 slotInUse,
                 recolourSlot,
                 chars: CHARS,
+                parsePaletteDocument,
+                mergePalettes,
+                trimRowsToPalette,
+                maxColors: MAX_COLORS,
             };
             // The shell width handle sweep touches the host DOM, so it is driven
             // through plain helpers that can be fed fake elements.

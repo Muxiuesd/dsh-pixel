@@ -508,6 +508,17 @@ function artCentre() {
     return { x: rect.x + rect.w / 2, y: rect.y + rect.h / 2 };
 }
 
+// Pointer coordinates derived from the artwork rect, so the helpers keep working
+// after the stage has been resized (cellCentre relies on the initial fit constants).
+function pointerAt(type, cellX, cellY, extra = {}) {
+    const rect = artRect();
+    const doc = state.docs[0];
+    if (!rect || !doc) throw new Error('artwork rect missing');
+    const px = rect.x + (cellX + 0.5) * rect.w / doc.w;
+    const py = rect.y + (cellY + 0.5) * rect.h / doc.h;
+    return pointer(type, (px - PAN - CELL / 2) / CELL, (py - PAN - CELL / 2) / CELL, extra);
+}
+
 function resizeStage(width, height) {
     stageSize.width = width;
     stageSize.height = height;
@@ -889,6 +900,74 @@ function loadModule() {
     autoFitOff.props.onClick({ preventDefault() {}, stopPropagation() {} });
     await pump('autofit-on');
     check('switching auto-fit back on reframes the artwork', zoomLabel() === '24×', zoomLabel());
+
+    /* 15. nothing but the selection itself may keep it alive -------------- */
+    key('m');
+    await pump('select-again');
+    pointerAt('onPointerDown', 0, 0);
+    pointerAt('onPointerMove', 1, 0);
+    pointerAt('onPointerUp', 1, 0);
+    await pump('selection-before-outside-press');
+    check('a 2×1 frame sits at 0,0 before the outside press', selectionLabel() === '2×1 @ 0,0', selectionLabel());
+
+    // A press beside the artwork must end the selection, not extend it to the edge.
+    pointerAt('onPointerDown', 8, 3);
+    await pump('press-outside');
+    check('pressing beside the artwork clears the selection', selectionLabel() === null, selectionLabel());
+
+    pointerAt('onPointerDown', 0, 0);
+    pointerAt('onPointerMove', 1, 0);
+    pointerAt('onPointerUp', 1, 0);
+    await pump('selection-before-swatch');
+    check('a 2×1 frame sits at 0,0 before the swatch click', selectionLabel() === '2×1 @ 0,0', selectionLabel());
+
+    // Picking another colour is not part of the selection: it ends it.
+    const swatches = byClass('pxs-swatch');
+    const otherSwatch = swatches[1];
+    check('the palette offers a second swatch', Boolean(otherSwatch));
+    if (otherSwatch) {
+        otherSwatch.props.onClick({ preventDefault() {}, stopPropagation() {} });
+        await pump('swatch-click');
+    }
+    check('picking another colour ends the selection', selectionLabel() === null, selectionLabel());
+
+    pointerAt('onPointerDown', 0, 0);
+    pointerAt('onPointerMove', 1, 0);
+    pointerAt('onPointerUp', 1, 0);
+    await pump('selection-before-tool');
+    check('a 2×1 frame sits at 0,0 before the tool switch', selectionLabel() === '2×1 @ 0,0', selectionLabel());
+
+    // Switching tools is not part of the selection either.
+    key('b');
+    await pump('tool-switch');
+    check('switching to the pencil ends the selection', selectionLabel() === null, selectionLabel());
+
+    /* 16. a stroke stops at the artwork edge ------------------------------ */
+    const rowBeforeEdge = rows()[2];
+    const rowAfterEdge = rowBeforeEdge.slice(0, 2) + '1' + rowBeforeEdge.slice(3);
+    pointerAt('onPointerDown', 2, 2);
+    pointerAt('onPointerMove', 20, 2);
+    pointerAt('onPointerUp', 20, 2);
+    await pump('stroke-leaves-canvas');
+    check('the stroke paints where it started', rowAt(2, 2) === '1', rows()[2]);
+    check('the stroke does not smear along the edge', rows()[2] === rowAfterEdge, `${rows()[2]} vs ${rowAfterEdge}`);
+
+    /* 17. interrupting a carried selection puts the pixels back ------------ */
+    key('m');
+    await pump('select-for-carry');
+    pointerAt('onPointerDown', 0, 0);
+    pointerAt('onPointerMove', 1, 0);
+    pointerAt('onPointerUp', 1, 0);
+    await pump('carry-select');
+    const carriedBefore = rowAt(0, 0);
+    pointerAt('onPointerDown', 0, 0, { shiftKey: true });
+    await pump('carry-lift');
+    key('b');
+    await pump('carry-interrupt');
+    pointerAt('onPointerUp', 0, 0);
+    await pump('carry-release');
+    check('interrupting a carried selection clears it', selectionLabel() === null, selectionLabel());
+    check('interrupting a carried selection puts the pixels back', rowAt(0, 0) === carriedBefore, `${rowAt(0, 0)} vs ${carriedBefore}`);
 
     console.log(failures === 0 ? 'PASS: selection interactions behave' : `FAIL: ${failures} check(s) failed`);
     process.exit(failures === 0 ? 0 : 1);

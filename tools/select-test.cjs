@@ -455,6 +455,96 @@ same('the composer bookkeeping is cleared', hiddenSeats.size, 0);
 same('a document without querySelectorAll is tolerated by the composer sweep',
     hideShellComposer(null, bareBody, new Map()), 0);
 
+console.log('palette document interchange');
+
+const { parsePaletteDocument, mergePalettes, trimRowsToPalette, maxColors } = paletteApi;
+
+same('a palette holds 256 slots', maxColors, 256);
+same('the character table has 256 entries', paletteApi.chars.length, 256);
+same('the legacy ascii characters still lead the table', paletteApi.chars.slice(0, 36), '0123456789abcdefghijklmnopqrstuvwxyz');
+
+function thrownMessage(fn) {
+    try {
+        fn();
+        return '';
+    } catch (cause) {
+        return cause instanceof Error ? cause.message : String(cause);
+    }
+}
+
+same('a plain array file is parsed and cleaned',
+    parsePaletteDocument('["#FF0000","#00ff00","#00FF00","bogus","#12345"]'),
+    ['#ff0000', '#00ff00']);
+same('a wrapped colors file is parsed',
+    parsePaletteDocument('{"colors":["#AbCdEf"]}'),
+    ['#abcdef']);
+same('invalid json is rejected',
+    thrownMessage(() => parsePaletteDocument('{"colors":[')).startsWith('不是有效的 JSON 文件（支持 JSON、.gpl、.pal）'),
+    true);
+same('the rejected file shows its opening text',
+    thrownMessage(() => parsePaletteDocument('garbage')).includes('文件开头是「garbage」'),
+    true);
+same('an empty file is rejected',
+    thrownMessage(() => parsePaletteDocument('   ')),
+    '文件是空的');
+same('a file without colors is rejected',
+    thrownMessage(() => parsePaletteDocument('{"name":"x"}')),
+    '缺少 colors 数组');
+same('a file without usable colors is rejected',
+    thrownMessage(() => parsePaletteDocument('["red","blue"]')),
+    '文件里没有找到颜色（支持 #rrggbb、#rgb、rgb(r,g,b)）');
+same('a byte order mark is ignored',
+    parsePaletteDocument('\uFEFF["#fff"]'),
+    ['#ffffff']);
+same('short hex is expanded',
+    parsePaletteDocument('["#abc"]'),
+    ['#aabbcc']);
+same('eight digit hex drops its alpha',
+    parsePaletteDocument('["#ff0000ff"]'),
+    ['#ff0000']);
+same('rgb() text is understood',
+    parsePaletteDocument('["rgb(1,2,3)"]'),
+    ['#010203']);
+same('numbers are understood',
+    parsePaletteDocument('[16711680]'),
+    ['#ff0000']);
+same('an object map of colours is understood',
+    parsePaletteDocument('{"colors":{"a":"#fff","b":"#000"}}'),
+    ['#ffffff', '#000000']);
+same('a gimp palette is understood',
+    parsePaletteDocument('GIMP Palette\nName: demo\nColumns: 2\n#\n255 0 0\tred\n  0 255 0\tgreen'),
+    ['#ff0000', '#00ff00']);
+same('a jasc palette is understood',
+    parsePaletteDocument('JASC-PAL\r\n0100\r\n2\r\n0 0 255\r\n255 255 0'),
+    ['#0000ff', '#ffff00']);
+same('colours are scraped out of loose text',
+    parsePaletteDocument('my palette #ff0000 and #00ff00 plus #000'),
+    ['#ff0000', '#00ff00', '#000000']);
+same('an image file is rejected with a clear message',
+    thrownMessage(() => parsePaletteDocument('\uFFFD' + 'PNG\r\n\u001a\n\u0000')).startsWith('这是图片文件'),
+    true);
+same('the exported document round trips',
+    parsePaletteDocument(JSON.stringify({ format: 'dsh-pixel-studio-palette', version: 1, name: '作品 6', colors: ['#000000', '#1d2b53', '#7e2553'] })),
+    ['#000000', '#1d2b53', '#7e2553']);
+same('oversized palettes are truncated to the limit',
+    parsePaletteDocument(JSON.stringify(Array.from({ length: 300 }, (_, i) => `#${String(i % 1000).padStart(3, '0')}000`.slice(0, 7)))).length,
+    256);
+
+const mergedSmall = mergePalettes(['#111111'], ['#111111', '#222222'], 4);
+same('merging skips colours already present', mergedSmall.palette, ['#111111', '#222222']);
+same('merging reports how many colours were added', mergedSmall.added, 1);
+same('merging reports nothing skipped while there is room', mergedSmall.skipped, 0);
+
+const mergedFull = mergePalettes(['#111111', '#222222'], ['#333333', '#444444', '#555555'], 3);
+same('merging stops at the limit', mergedFull.palette, ['#111111', '#222222', '#333333']);
+same('merging counts the colours over the limit', mergedFull.skipped, 2);
+
+const trimmed = trimRowsToPalette([{ name: 'a', visible: true, rows: ['001', '110'] }], 1);
+same('trimming clears cells beyond the palette', trimmed[0].rows, ['00.', '..0']);
+same('trimming leaves shorter palettes alone',
+    trimRowsToPalette([{ name: 'a', visible: true, rows: ['012'] }], 8)[0].rows[0],
+    '012');
+
 if (failures > 0) {
     console.error(`FAIL: ${failures} selection assertion(s) failed`);
     process.exit(1);
