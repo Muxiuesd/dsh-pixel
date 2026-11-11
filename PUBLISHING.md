@@ -7,7 +7,7 @@
 | 项 | 值 |
 | --- | --- |
 | npm 包名 | `@muxiuesd/dsh-pixel-studio` |
-| 当前版本 | `0.1.1` |
+| 当前版本 | `0.5.0` |
 | Gitee（主仓库） | <https://gitee.com/muxiuesd12138/dsh-pixel> |
 | GitHub（镜像，自动同步） | <https://github.com/Muxiuesd/dsh-pixel> |
 | 仓库布局 | 根目录就是插件包（`package.json` / `index.js` / `client.js` / `cordis.patch.yml` / `locale/` / `icon.png`） |
@@ -44,7 +44,7 @@ npm.cmd publish --dry-run
 npm.cmd publish --otp=123456
 ```
 
-`npm.cmd publish` 成功后终端会打印 `+ @muxiuesd/dsh-pixel-studio@0.1.1` 和本次的 shasum。
+`npm.cmd publish` 成功后终端会打印 `+ @muxiuesd/dsh-pixel-studio@0.5.0` 和本次的 shasum。
 
 > Windows 上 `npm` 的 PowerShell 包装脚本（`npm.ps1`）常被执行策略挡住，所以一律写 `npm.cmd`。
 
@@ -78,7 +78,7 @@ locale/en.json  locale/zh.json
 ## 5. 版本流转
 
 ```bash
-npm.cmd version patch -m "release %s"   # 0.1.1 -> 0.1.2
+npm.cmd version patch -m "release %s"   # 0.5.0 -> 0.5.1
 npm.cmd version minor                   # -> 0.2.0
 npm.cmd version major                   # -> 1.0.0
 
@@ -88,9 +88,9 @@ npm.cmd publish --otp=123456
 
 **同一个版本号不能发布第二次**（npm 永久保留）。发错了的处理：
 
-- 打错内容但想保留版本号 → 只能发 `0.1.2`；
-- 内容有严重问题 → `npm.cmd deprecate @muxiuesd/dsh-pixel-studio@0.1.1 "broken build"`，然后发新版；
-- 发布后 72 小时内、且没有别的包依赖它 → 可以 `npm.cmd unpublish @muxiuesd/dsh-pixel-studio@0.1.1`（慎用）。
+- 打错内容但想保留版本号 → 只能发 `0.5.1`；
+- 内容有严重问题 → `npm.cmd deprecate @muxiuesd/dsh-pixel-studio@0.5.0 "broken build"`，然后发新版；
+- 发布后 72 小时内、且没有别的包依赖它 → 可以 `npm.cmd unpublish @muxiuesd/dsh-pixel-studio@0.5.0`（慎用）。
 
 ## 6. 进入市场的三条路
 
@@ -106,14 +106,14 @@ npm.cmd publish --otp=123456
 {
   "id": "dsh-pixel-studio",
   "name": "像素画工作室",
-  "description": "在会话页签里画像素画：三栏编辑器、整数倍缩放、图层、调色板与 PNG 导出，作品存本机。",
+  "description": "在会话页签里画像素画：三栏编辑器、连续缩放 0.125×–64×、2048×2048 画布、图层、矩形选区、256 色调色板与调色板 JSON 导入导出，PNG 导出到本机。",
   "category": "watchlist",
   "tags": ["像素画", "绘图", "编辑器", "图像"],
   "source": "npm",
   "npm": "@muxiuesd/dsh-pixel-studio",
   "homepage": "https://gitee.com/muxiuesd12138/dsh-pixel",
   "icon": "https://cdn.jsdelivr.net/npm/@muxiuesd/dsh-pixel-studio@0/icon.png",
-  "verified": ["0.1.1"]
+  "verified": ["0.5.0"]
 }
 ```
 
@@ -126,7 +126,7 @@ npm.cmd publish --otp=123456
 - `source` 只能是 `npm` 或 `github`。写 `github` 时字段是 `"github": "Muxiuesd/dsh-pixel"`（`owner/repo`）。
 - `npm` 字段只写包名，**不能带版本、range 或 URL**。
 - `homepage` / `icon` 必须是 HTTPS。
-- `verified` 是**精确版本号数组**（如 `["0.1.1"]`），语义是「这几个版本我实测过」。
+- `verified` 是**精确版本号数组**（如 `["0.5.0"]`），语义是「这几个版本我实测过」。
 - `category` 取 `essentials / cui-picks / baoyu / guizang / self-dev / tencent-lighthouse / watchlist` 之一，或社区分类 slug；`alsoCategories` 不能与主分类重复。
 
 ### 6.2 社区目录

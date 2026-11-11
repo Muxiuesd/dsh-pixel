@@ -1,12 +1,12 @@
 # 进入 DSH 插件市场：可执行清单
 
-> 面向 `@muxiuesd/dsh-pixel-studio` 0.1.1。npm 已上线，市场收录还没做 —— 本文把「点哪里、粘什么、验证什么」写全。
+> 面向 `@muxiuesd/dsh-pixel-studio` 0.5.0。npm 已上线，市场收录还没做 —— 本文把「点哪里、粘什么、验证什么」写全。
 
 ## 现状
 
 | 通道 | 状态 | 卡在哪 |
 |---|---|---|
-| npm | ✅ 已上线 `0.1.1`（latest） | — |
+| npm | ✅ 已上线 `0.5.0`（latest） | — |
 | 社区目录（6000+，`dshm_search` 来源之一） | 🟡 PR [#12712](https://github.com/awesome-dsh-plugin/awesome-dsh-plugin/pull/12712) 已提交，`check` 绿 / `Submission gate` 红（唯一问题=仓库年龄） | `repository is 0.1 days old (needs 1) — … should clear in about 23h`；北京时间 2026-11-07 21:20 满足，`regate` cron（11-07 `18:19Z` ≈ 北京 11-08 02:20）自动转绿，之后等合并 |
 | 精选清单（33 条手工收录） | ❌ 未收录 | 还没给 `iasiv5/dsh-m` 提 `registry.json` PR |
 
@@ -68,13 +68,13 @@ url: https://github.com/Muxiuesd/dsh-pixel
 name: Muxiuesd/dsh-pixel
 category: ui
 description:
-  en: 'Pixel art editor in a DSH conversation tab: pencil, eraser, bucket fill and eyedropper on a grid canvas that zooms in whole steps around the cursor; up to eight layers with merge, reorder, rename and full undo; a 36-slot palette whose edits move the old colour to a free slot so existing pixels never change; PNG export written straight into the session directory.'
-  zh: 'DSH 会话页签里的像素画编辑器：在网格画布上用铅笔、橡皮、油漆桶与取色器作画，滚轮以光标为中心整档缩放；最多八层图层，支持合并、上下移、改名与完整撤销；36 色可编辑调色板，改色时把旧颜色搬到空闲槽，已有像素不会跟着变；PNG 直接导出到当前会话目录。'
+  en: 'Pixel art editor in a DSH conversation tab: pencil, eraser, bucket fill, eyedropper and a rectangular selection tool on a grid canvas that zooms continuously from 0.125x to 64x around the cursor, up to 2048x2048 with an optional grid and fit-to-window; up to eight layers with merge, reorder, rename, hide and full undo; a palette of up to 256 colours with a colour wheel whose edits move the old colour to a free slot so existing pixels never change; PNG export and palette JSON import/export written straight into the session directory.'
+  zh: 'DSH 会话页签里的像素画编辑器：在网格画布上用铅笔、橡皮、油漆桶、取色器与矩形选区作画，滚轮以光标为中心连续缩放（0.125×–64×），画布最大 2048×2048，可开格线与自动适应；最多八层图层，支持合并、上下移、改名、显隐与完整撤销；调色板最多 256 色并带取色环，改色时把旧颜色搬到空闲槽，已有像素不会跟着变；PNG 导出与调色板 JSON 导入导出都直接写到当前会话目录。'
 icon: https://raw.githubusercontent.com/Muxiuesd/dsh-pixel/main/icon.png
 ```
 
 > 描述里含 `: `（冒号+空格）时必须加引号，否则 YAML 会把它当嵌套键 —— 上面两条描述都加了单引号。
-> 描述被当作**对你代码的声明**来核对：我按 `client.js` 实际实现写（`TOOLS` 只有 pencil / eraser / bucket / picker，`MAX_LAYERS = 8`，`CHARS` 36 色），没有写直线工具、没有写动画帧 —— 这两样插件确实没有。
+> 描述被当作**对你代码的声明**来核对：我按 `client.js` 实际实现写（`TOOLS` 是 pencil / eraser / bucket / picker / select，`MAX_LAYERS = 8`，`MAX_COLORS = 256`，`MAX_SIDE = 2048`，缩放是 `MIN_ZOOM = 0.125` / `MAX_ZOOM = 64` 的连续值），没有写直线工具、没有写动画帧 —— 这两样插件确实没有。
 
 ### CI 闸门（`scripts/check-submission.mjs`，只有三条）
 
@@ -108,7 +108,7 @@ Add Muxiuesd/dsh-pixel — pixel art editor in a conversation tab
 - [x] Description states what the plugin does, no superlatives.
 - [x] My repo has the `dsh-plugin` topic.
 
-The plugin is a pixel art editor that renders as a third conversation view. Left pane: four tools (pencil, eraser, bucket fill, eyedropper) with keyboard shortcuts; canvas in the middle with whole-step zoom anchored at the cursor, space/middle-drag pan, optional grid; right pane: a 36-slot palette. Layers support add/duplicate/merge down/reorder/rename/hide, capped at 8, all undoable. Editing a palette slot moves the old colour to an unused slot and remaps references, so existing pixels never change. Export writes a 1× PNG straight into the session directory (first export asks where, later exports overwrite); Ctrl+S saves, Ctrl+Shift+S is Save As. Data stays in `~/.dsh/pixel-studio/works.json`; one host route serves the tab; no outbound network, no runtime dependencies. Published to npm as `@muxiuesd/dsh-pixel-studio@0.1.1`.
+The plugin is a pixel art editor that renders as a third conversation view. Left pane: pencil, eraser, bucket fill, eyedropper and a rectangular selection tool with keyboard shortcuts; canvas in the middle with continuous zoom from 0.125x to 64x anchored at the cursor, canvases up to 2048x2048, space/middle-drag pan and an optional grid. Right pane: a palette of up to 256 colours with a colour wheel, plus JSON import/export (it also accepts .gpl, .pal and any text with #rrggbb colours). Layers support add/duplicate/merge down/reorder/rename/hide, capped at 8, all undoable. Editing a palette slot is a draft until you press Done, and the old colour moves to an unused slot with references remapped, so existing pixels never change. Export writes a PNG (1x-16x) straight into the session directory (the first export asks where, later exports overwrite); Ctrl+S saves and Ctrl+Shift+S is Save As. Drawings live in `~/.dsh/pixel-studio/works.json`, one host route serves the tab, and there is no outbound network and no runtime dependency. Published to npm as `@muxiuesd/dsh-pixel-studio@0.5.0`.
 ```
 
 ### 收录后自查（等 1–2 天）：
@@ -147,9 +147,9 @@ PR 合并后最多等一次构建（`npm view dsh-plugin-catalog version` 变新
   "tags": ["pixel-art", "canvas", "editor", "image", "export"],
   "source": "npm",
   "npm": "@muxiuesd/dsh-pixel-studio",
-  "icon": "https://unpkg.com/@muxiuesd/dsh-pixel-studio@0.1.1/icon.png",
+  "icon": "https://unpkg.com/@muxiuesd/dsh-pixel-studio@0.5.0/icon.png",
   "homepage": "https://github.com/Muxiuesd/dsh-pixel",
-  "verified": ["0.1.1"]
+  "verified": ["0.5.0"]
 }
 ```
 
@@ -165,10 +165,10 @@ PR 合并后最多等一次构建（`npm view dsh-plugin-catalog version` 变新
 | `source` ∈ `npm` \| `github` | `npm` ✅ |
 | `npm` 匹配 `NPM_RE`（scoped 允许） | `@muxiuesd/dsh-pixel-studio` ✅ |
 | `homepage` / `icon` 必须 HTTPS | 两条都 ✅ |
-| `verified` 精确 semver 数组 | `["0.1.1"]` ✅ |
+| `verified` 精确 semver 数组 | `["0.5.0"]` ✅ |
 | 未知字段一律拒收 | 只有上述字段 ✅ |
 
-**图标 URL 已实测**：`https://unpkg.com/@muxiuesd/dsh-pixel-studio@0.1.1/icon.png` → `200`、`image/png`、`131 B`。本机到 `cdn.jsdelivr.net` 的 TLS 是不通的，所以条目里用 unpkg；jsdelivr 留作备选。
+**图标 URL 已实测**：`https://unpkg.com/@muxiuesd/dsh-pixel-studio@0.5.0/icon.png` → `200`、`image/png`、`131 B`。本机到 `cdn.jsdelivr.net` 的 TLS 是不通的，所以条目里用 unpkg；jsdelivr 留作备选。
 
 **PR 标题**
 
@@ -190,7 +190,7 @@ Adds `dsh-pixel-studio`, a hand-drawn pixel art editor that lives in a conversat
   where, later exports overwrite); Save As with Ctrl+Shift+S
 
 Registry entry validated with `validateRegistry` from `lib/core/registry.js`:
-source `npm`, package `@muxiuesd/dsh-pixel-studio@0.1.1`, icon 200 / image/png.
+source `npm`, package `@muxiuesd/dsh-pixel-studio@0.5.0`, icon 200 / image/png.
 
 Everything stays local: one route `/dsh-pixel-studio` on the host webserver,
 no outbound network, data in `~/.dsh/pixel-studio/works.json`.
@@ -201,9 +201,9 @@ no outbound network, data in `~/.dsh/pixel-studio/works.json`.
 ## 4. 收录之后
 
 - 发新版：`npm.cmd version patch` → `npm.cmd publish --otp=XXXXXX`（granular token 免不了发布 OTP）→ `git.cmd push --follow-tags`。
-- 精选条目：把新版本追加进 `verified`（`["0.1.1", "0.1.2"]`），要重新提 PR 改这一行。
+- 精选条目：把新版本追加进 `verified`（`["0.5.0", "0.5.1"]`），要重新提 PR 改这一行。
 - 社区目录：下次构建自动更新版本号与描述，不用动。
-- 图标 URL 里的 `@0.1.1` 可以一直指向旧版本（图标没变就无需改）。
+- 图标 URL 里的 `@0.5.0` 可以一直指向旧版本（图标没变就无需改）。
 
 ---
 

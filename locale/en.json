@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "Pixel Studio",
-    "description": "Draw pixel art inside DSH: tools on the left, a zoomable canvas in the middle, palette on the right. Artworks are saved locally."
+    "description": "Pixel art inside DSH: a three-pane editor with continuous zoom (0.125x-64x), canvases up to 2048x2048, layers, rectangular selection, a 256-colour palette with JSON import/export, and PNG export to your machine."
   }
 }
