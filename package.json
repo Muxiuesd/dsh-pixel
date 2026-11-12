@@ -1,7 +1,7 @@
 {
   "name": "@muxiuesd/dsh-pixel-studio",
-  "version": "0.5.1",
-  "description": "在 DSH 里画像素画：三栏编辑器（左工具 / 中画布 / 右调色板），连续缩放、图层、矩形选区、最多 256 色调色板（可导入导出 JSON），支持 2048×2048 画布，导出 PNG 与调色板 JSON。",
+  "version": "0.6.0",
+  "description": "在 DSH 里画像素画：三栏编辑器（左工具 / 中画布 / 右调色板），连续缩放、直线 / 矩形 / 椭圆（可填充）、图层、矩形选区、最多 256 色调色板（可导入导出 JSON），支持 2048×2048 画布，导出 PNG 与调色板 JSON。",
   "type": "module",
   "main": "./index.js",
   "icon": "./icon.png",

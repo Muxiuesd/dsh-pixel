@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "Pixel Studio",
-    "description": "Pixel art inside DSH: a three-pane editor with continuous zoom (0.125x-64x), canvases up to 2048x2048, layers, rectangular selection, a 256-colour palette with JSON import/export, and PNG export to your machine."
+    "description": "Pixel art inside DSH: a three-pane editor with continuous zoom (0.125x-64x), canvases up to 2048x2048, layers, rectangular selection, line / rectangle / ellipse tools with fill, a 256-colour palette with JSON import/export, and PNG export to your machine."
   }
 }
