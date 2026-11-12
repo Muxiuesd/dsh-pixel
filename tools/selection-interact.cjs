@@ -53,7 +53,10 @@ function makeContext(rects) {
         restore: () => {},
         moveTo: () => {},
         lineTo: () => {},
+        closePath: () => {},
+        fill: () => {},
         stroke: () => {},
+        globalAlpha: 1,
         setLineDash: () => {},
         lineDashOffset: 0,
         imageSmoothingEnabled: true,
@@ -968,6 +971,243 @@ function loadModule() {
     await pump('carry-release');
     check('interrupting a carried selection clears it', selectionLabel() === null, selectionLabel());
     check('interrupting a carried selection puts the pixels back', rowAt(0, 0) === carriedBefore, `${rowAt(0, 0)} vs ${carriedBefore}`);
+
+    /* 18. shape tools: preview, drag, resize, commit, cancel -------------- */
+    const byTitle = (title) => findAll((node) => node.props.title === title);
+    const shapeBarCount = () => byClass('pxs-shape-bar').length;
+    const shapeLabel = () => {
+        if (shapeBarCount() === 0) return null;
+        const node = byClass('pxs-shape-bar')[0] && findAll((entry) => typeof entry.props.className === 'string'
+            && entry.props.className.split(/\s+/).includes('pxs-selection-label'))[0];
+        return node ? textOf(node).trim() : null;
+    };
+
+    key('l');
+    await pump('shape-line-tool');
+    check('the line tool reports itself active', byTitle('直线 (L)').some((node) => node.props['data-active'] === true));
+
+    const blankRows = rows();
+    pointerAt('onPointerDown', 2, 2);
+    pointerAt('onPointerMove', 6, 2);
+    pointerAt('onPointerUp', 6, 2);
+    await pump('shape-line-drag');
+    check('dragging with the line tool opens the panel', shapeBarCount() === 1);
+    check('the panel reports the line size', shapeLabel() === '直线 5×1', shapeLabel());
+    check('the preview stays out of the artwork', JSON.stringify(rows()) === JSON.stringify(blankRows));
+
+    key('Escape');
+    await pump('shape-escape');
+    check('escape drops the preview', shapeBarCount() === 0);
+    check('escape leaves the artwork alone', JSON.stringify(rows()) === JSON.stringify(blankRows));
+
+    pointerAt('onPointerDown', 2, 2);
+    pointerAt('onPointerMove', 6, 2);
+    pointerAt('onPointerUp', 6, 2);
+    await pump('shape-line-again');
+    const shapeConfirm = byText('✓ 确认', 'button')[0];
+    check('the panel offers a confirm button', Boolean(shapeConfirm));
+    if (shapeConfirm) {
+        shapeConfirm.props.onClick({ preventDefault() {}, stopPropagation() {} });
+        await pump('shape-confirm');
+    }
+    const lineChars = [2, 3, 4, 5, 6].map((x) => rowAt(x, 2));
+    check('confirming paints the whole line', lineChars.every((ch) => ch === lineChars[0] && ch !== '.'), lineChars.join(''));
+    check('confirming closes the panel', shapeBarCount() === 0);
+
+    key('z', { ctrlKey: true });
+    await pump('shape-undo');
+    check('one undo removes the shape', JSON.stringify(rows()) === JSON.stringify(blankRows), rows()[2]);
+
+    key('r');
+    await pump('shape-rect-tool');
+    pointerAt('onPointerDown', 2, 2);
+    pointerAt('onPointerMove', 5, 3);
+    pointerAt('onPointerUp', 5, 3);
+    await pump('shape-rect-drag');
+    check('the rectangle panel reports its size', shapeLabel() === '矩形 4×2', shapeLabel());
+
+    pointerAt('onPointerDown', 5, 3);
+    pointerAt('onPointerMove', 7, 4);
+    pointerAt('onPointerUp', 7, 4);
+    await pump('shape-rect-resize');
+    check('dragging the corner handle resizes the preview', shapeLabel() === '矩形 6×3', shapeLabel());
+
+    pointerAt('onPointerDown', 30, 2);
+    await pump('shape-outside-press');
+    check('pressing beside the artwork cancels the preview', shapeBarCount() === 0);
+
+    key('r');
+    await pump('shape-rect-again');
+    pointerAt('onPointerDown', 1, 1);
+    pointerAt('onPointerMove', 6, 3, { shiftKey: true });
+    pointerAt('onPointerUp', 6, 3);
+    await pump('shape-rect-shift');
+    check('shift forces a square', shapeLabel() === '矩形 6×6', shapeLabel());
+
+    key('Escape');
+    await pump('shape-final-cleanup');
+
+    /* 19. the fill toggle fills rectangles and ellipses ------------------- */
+    key('l');
+    await pump('fill-line-tool');
+    pointerAt('onPointerDown', 2, 2);
+    pointerAt('onPointerMove', 5, 2);
+    pointerAt('onPointerUp', 5, 2);
+    await pump('fill-line-drag');
+    check('a line offers no fill toggle', byText('是否填充', 'button').length === 0);
+    key('Escape');
+    await pump('fill-line-cancel');
+
+    const hollowRows = rows();
+    // Four rows tall, so the two middle rows are interior and not outline.
+    key('r');
+    await pump('fill-rect-tool');
+    pointerAt('onPointerDown', 2, 1);
+    pointerAt('onPointerMove', 5, 4);
+    pointerAt('onPointerUp', 5, 4);
+    await pump('fill-rect-drag');
+    const fillToggle = byText('是否填充', 'button')[0];
+    check('a rectangle offers a fill toggle', Boolean(fillToggle));
+    check('the fill toggle starts off', !fillToggle || fillToggle.props['data-active'] !== true);
+
+    byText('✓ 确认', 'button')[0].props.onClick({ preventDefault() {}, stopPropagation() {} });
+    await pump('fill-rect-hollow-commit');
+    check('without fill the interior stays empty', rowAt(3, 2) === hollowRows[2][3], rowAt(3, 2));
+    check('without fill the outline corners are painted', rowAt(2, 1) !== hollowRows[1][2], rowAt(2, 1));
+    key('z', { ctrlKey: true });
+    await pump('fill-rect-hollow-undo');
+    check('undo removes the hollow rectangle', JSON.stringify(rows()) === JSON.stringify(hollowRows));
+
+    key('r');
+    await pump('fill-rect-again');
+    pointerAt('onPointerDown', 2, 1);
+    pointerAt('onPointerMove', 5, 4);
+    pointerAt('onPointerUp', 5, 4);
+    await pump('fill-rect-drag-again');
+    const fillOn = byText('是否填充', 'button')[0];
+    check('the fill toggle is offered again', Boolean(fillOn));
+    if (fillOn) {
+        fillOn.props.onClick({ preventDefault() {}, stopPropagation() {} });
+        await pump('fill-toggled');
+    }
+    check('clicking fill marks the toggle active', byText('是否填充', 'button')[0].props['data-active'] === true);
+    byText('✓ 确认', 'button')[0].props.onClick({ preventDefault() {}, stopPropagation() {} });
+    await pump('fill-rect-commit');
+
+    const interior = [[3, 2], [4, 2], [3, 3], [4, 3]].map(([x, y]) => rowAt(x, y));
+    check('the filled rectangle has no holes',
+        interior.every((ch) => ch === interior[0] && ch !== '.'),
+        interior.join(''));
+    check('the filled rectangle keeps its outline', rowAt(2, 1) === interior[0] && rowAt(5, 4) === interior[0]);
+
+    key('z', { ctrlKey: true });
+    await pump('fill-rect-undo');
+    check('undo removes the filled rectangle', JSON.stringify(rows()) === JSON.stringify(hollowRows));
+
+    // An ellipse fills its interior too. Counting the cells painted with the
+    // freshly picked pen is independent of whatever the canvas already holds.
+    const penSwatch = byClass('pxs-swatch')[2];
+    check('a third swatch is available for the ellipse test', Boolean(penSwatch));
+    if (penSwatch) {
+        penSwatch.props.onClick({ preventDefault() {}, stopPropagation() {} });
+        await pump('fill-ellipse-pen');
+    }
+    let penChar = null;
+
+    const countPen = (x0, y0, x1, y1, pen) => {
+        let total = 0;
+        for (let y = y0; y <= y1; y += 1) {
+            for (let x = x0; x <= x1; x += 1) if (rowAt(x, y) === pen) total += 1;
+        }
+        return total;
+    };
+    const drawEllipse = async (label) => {
+        key('o');
+        await pump(`${label}-tool`);
+        pointerAt('onPointerDown', 1, 1);
+        pointerAt('onPointerMove', 6, 6);
+        pointerAt('onPointerUp', 6, 6);
+        await pump(`${label}-drag`);
+    };
+
+    await drawEllipse('fill-ellipse-hollow');
+    const hollowToggle = byText('是否填充', 'button')[0];
+    check('an ellipse offers a fill toggle', Boolean(hollowToggle));
+    if (hollowToggle && hollowToggle.props['data-active'] === true) {
+        hollowToggle.props.onClick({ preventDefault() {}, stopPropagation() {} });
+        await pump('fill-ellipse-hollow-toggled');
+    }
+    byText('✓ 确认', 'button')[0].props.onClick({ preventDefault() {}, stopPropagation() {} });
+    await pump('fill-ellipse-hollow-commit');
+    for (let y = 1; y <= 6 && penChar === null; y += 1) {
+        for (let x = 1; x <= 6; x += 1) {
+            if (rowAt(x, y) !== hollowRows[y][x]) {
+                penChar = rowAt(x, y);
+                break;
+            }
+        }
+    }
+    check('the hollow ellipse paints something', penChar !== null, penChar);
+    const hollowOutline = penChar === null ? 0 : countPen(1, 1, 6, 6, penChar);
+    check('the hollow ellipse paints its outline', hollowOutline > 0, hollowOutline);
+    key('z', { ctrlKey: true });
+    await pump('fill-ellipse-hollow-undo');
+
+    await drawEllipse('fill-ellipse-filled');
+    const ellipseFill = byText('是否填充', 'button')[0];
+    if (ellipseFill && ellipseFill.props['data-active'] !== true) {
+        ellipseFill.props.onClick({ preventDefault() {}, stopPropagation() {} });
+        await pump('fill-ellipse-toggled');
+    }
+    byText('✓ 确认', 'button')[0].props.onClick({ preventDefault() {}, stopPropagation() {} });
+    await pump('fill-ellipse-commit');
+    const filledCells = countPen(1, 1, 6, 6, penChar);
+    check('filling the ellipse paints more cells than its outline',
+        filledCells > hollowOutline,
+        `${hollowOutline} -> ${filledCells}`);
+    key('z', { ctrlKey: true });
+    await pump('fill-ellipse-undo');
+    check('undo removes the filled ellipse', JSON.stringify(rows()) === JSON.stringify(hollowRows));
+
+    /* 20. the fill switch is per tool ------------------------------------ */
+    key('r');
+    await pump('fill-rect-switch-tool');
+    pointerAt('onPointerDown', 2, 1);
+    pointerAt('onPointerMove', 5, 4);
+    pointerAt('onPointerUp', 5, 4);
+    await pump('fill-rect-switch-drag');
+    const rectSwitch = byText('是否填充', 'button')[0];
+    check('the rectangle remembers its own fill switch',
+        Boolean(rectSwitch) && rectSwitch.props['data-active'] === true,
+        rectSwitch ? String(rectSwitch.props['data-active']) : 'missing');
+    if (rectSwitch) {
+        rectSwitch.props.onClick({ preventDefault() {}, stopPropagation() {} });
+        await pump('fill-rect-switch-off');
+    }
+    const rectSwitchOff = byText('是否填充', 'button')[0];
+    check('the fill control is a switch that turns off',
+        Boolean(rectSwitchOff) && rectSwitchOff.props['data-active'] === false,
+        rectSwitchOff ? String(rectSwitchOff.props['data-active']) : 'missing');
+    check('the fill switch answers aria-checked too',
+        Boolean(rectSwitchOff) && rectSwitchOff.props['aria-checked'] === false,
+        rectSwitchOff ? String(rectSwitchOff.props['aria-checked']) : 'missing');
+    key('Escape');
+    await pump('fill-rect-switch-cancel');
+
+    key('o');
+    await pump('fill-ellipse-switch-tool');
+    pointerAt('onPointerDown', 1, 1);
+    pointerAt('onPointerMove', 6, 6);
+    pointerAt('onPointerUp', 6, 6);
+    await pump('fill-ellipse-switch-drag');
+    const ellipseSwitch = byText('是否填充', 'button')[0];
+    check('turning the rectangle switch off leaves the ellipse alone',
+        Boolean(ellipseSwitch) && ellipseSwitch.props['data-active'] === true,
+        ellipseSwitch ? String(ellipseSwitch.props['data-active']) : 'missing');
+    key('Escape');
+    await pump('fill-switch-cleanup');
+    check('cancelling a shape leaves the pixels untouched',
+        JSON.stringify(rows()) === JSON.stringify(hollowRows));
 
     console.log(failures === 0 ? 'PASS: selection interactions behave' : `FAIL: ${failures} check(s) failed`);
     process.exit(failures === 0 ? 0 : 1);

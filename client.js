@@ -124,6 +124,19 @@ window.__ModuleLoader__.load({
             { id: 'select', label: '选区', key: 'M', icon: 'select' },
         ];
 
+        /**
+         * Shape tools all share one pipeline: drag out a preview, refine it with
+         * the handles, then confirm. Nothing reaches the layer until 确认, so a
+         * half-drawn ellipse can never end up saved.
+         */
+        const SHAPE_TOOLS = [
+            { id: 'line', label: '直线', key: 'L', icon: 'line' },
+            { id: 'rect', label: '矩形', key: 'R', icon: 'rect' },
+            { id: 'ellipse', label: '椭圆', key: 'O', icon: 'ellipse' },
+        ];
+        const SHAPE_TOOL_IDS = SHAPE_TOOLS.map((entry) => entry.id);
+        const SHAPE_LABELS = { line: '直线', rect: '矩形', ellipse: '椭圆' };
+
         /* ------------------------------------------------------------------ */
         /* transport                                                          */
         /* ------------------------------------------------------------------ */
@@ -245,6 +258,228 @@ window.__ModuleLoader__.load({
                 }
             }
             return cells;
+        }
+
+        /* ------------------------------------------------------------------ */
+        /* shape geometry                                                    */
+        /* ------------------------------------------------------------------ */
+
+        /**
+         * Rectangles and ellipses are stored as opposite corners in the normalised
+         * order (top-left, bottom-right); lines keep the two endpoints as drawn so
+         * the handles stay on the ends the user actually dragged.
+         */
+        function normalizeShape(shape) {
+            if (!shape || shape.tool === 'line') return shape;
+            return {
+                ...shape,
+                x0: Math.min(shape.x0, shape.x1),
+                y0: Math.min(shape.y0, shape.y1),
+                x1: Math.max(shape.x0, shape.x1),
+                y1: Math.max(shape.y0, shape.y1),
+            };
+        }
+
+        function rectCells(x0, y0, x1, y1) {
+            const left = Math.min(x0, x1);
+            const right = Math.max(x0, x1);
+            const top = Math.min(y0, y1);
+            const bottom = Math.max(y0, y1);
+            const cells = [];
+            for (let x = left; x <= right; x += 1) {
+                cells.push([x, top]);
+                if (bottom !== top) cells.push([x, bottom]);
+            }
+            for (let y = top + 1; y < bottom; y += 1) {
+                cells.push([left, y]);
+                if (right !== left) cells.push([right, y]);
+            }
+            return cells;
+        }
+
+        /**
+         * Dense parametric sampling: at eight samples per cell the rounded points
+         * stay 8-connected, so the outline has no gaps even for tiny ellipses.
+         */
+        function ellipseCells(x0, y0, x1, y1) {
+            const left = Math.min(x0, x1);
+            const right = Math.max(x0, x1);
+            const top = Math.min(y0, y1);
+            const bottom = Math.max(y0, y1);
+            const centreX = (left + right) / 2;
+            const centreY = (top + bottom) / 2;
+            const radiusX = (right - left) / 2;
+            const radiusY = (bottom - top) / 2;
+            if (radiusX === 0 && radiusY === 0) return [[left, top]];
+            const steps = Math.max(24, Math.ceil(Math.PI * 2 * Math.max(radiusX, radiusY) * 4));
+            const seen = new Set();
+            const cells = [];
+            for (let step = 0; step < steps; step += 1) {
+                const angle = (step / steps) * Math.PI * 2;
+                const x = Math.round(centreX + radiusX * Math.cos(angle));
+                const y = Math.round(centreY + radiusY * Math.sin(angle));
+                const key = `${x},${y}`;
+                if (seen.has(key)) continue;
+                seen.add(key);
+                cells.push([x, y]);
+            }
+            return cells;
+        }
+
+        function shapeCells(shape) {
+            if (!shape) return [];
+            if (shape.tool === 'line') return lineCells(shape.x0, shape.y0, shape.x1, shape.y1);
+            if (shape.tool === 'rect') return rectCells(shape.x0, shape.y0, shape.x1, shape.y1);
+            return ellipseCells(shape.x0, shape.y0, shape.x1, shape.y1);
+        }
+
+        /**
+         * Solid cells for a shape. A line has no inside, so filling it is a no-op.
+         * The ellipse rows are computed from the ellipse equation (a scanline fill)
+         * and then unioned with the sampled outline, because rounding can put an
+         * outline cell just outside the scanline span.
+         */
+        function filledShapeCells(shape) {
+            if (!shape) return [];
+            if (shape.tool === 'line') return lineCells(shape.x0, shape.y0, shape.x1, shape.y1);
+            const left = Math.min(shape.x0, shape.x1);
+            const right = Math.max(shape.x0, shape.x1);
+            const top = Math.min(shape.y0, shape.y1);
+            const bottom = Math.max(shape.y0, shape.y1);
+            const seen = new Set();
+            const cells = [];
+            const push = (x, y) => {
+                const key = `${x},${y}`;
+                if (seen.has(key)) return;
+                seen.add(key);
+                cells.push([x, y]);
+            };
+            if (shape.tool === 'rect') {
+                for (let y = top; y <= bottom; y += 1) {
+                    for (let x = left; x <= right; x += 1) push(x, y);
+                }
+                return cells;
+            }
+            const centreX = (left + right) / 2;
+            const centreY = (top + bottom) / 2;
+            const radiusX = (right - left) / 2;
+            const radiusY = (bottom - top) / 2;
+            for (let y = top; y <= bottom; y += 1) {
+                const ratio = radiusY === 0 ? (y === centreY ? 0 : 2) : (y - centreY) / radiusY;
+                if (Math.abs(ratio) > 1) continue;
+                const half = radiusX * Math.sqrt(Math.max(0, 1 - ratio * ratio));
+                for (let x = Math.round(centreX - half); x <= Math.round(centreX + half); x += 1) push(x, y);
+            }
+            for (const [x, y] of ellipseCells(left, top, right, bottom)) push(x, y);
+            return cells;
+        }
+
+        function shapeBounds(shape) {
+            if (!shape) return null;
+            const x = Math.min(shape.x0, shape.x1);
+            const y = Math.min(shape.y0, shape.y1);
+            return {
+                x,
+                y,
+                w: Math.abs(shape.x1 - shape.x0) + 1,
+                h: Math.abs(shape.y1 - shape.y0) + 1,
+            };
+        }
+
+        /** Eight box handles for rect/ellipse, two endpoints for a line. */
+        function shapeHandles(shape) {
+            if (!shape) return [];
+            if (shape.tool === 'line') {
+                return [
+                    { kind: 'p0', x: shape.x0, y: shape.y0 },
+                    { kind: 'p1', x: shape.x1, y: shape.y1 },
+                ];
+            }
+            const bounds = shapeBounds(shape);
+            const left = bounds.x;
+            const top = bounds.y;
+            const right = bounds.x + bounds.w - 1;
+            const bottom = bounds.y + bounds.h - 1;
+            const middleX = Math.round((left + right) / 2);
+            const middleY = Math.round((top + bottom) / 2);
+            return [
+                // Corners come first: on a two-cell-tall box the side handles
+                // overlap them, and a corner drag is what people mean.
+                { kind: 'nw', x: left, y: top },
+                { kind: 'ne', x: right, y: top },
+                { kind: 'se', x: right, y: bottom },
+                { kind: 'sw', x: left, y: bottom },
+                { kind: 'n', x: middleX, y: top },
+                { kind: 'e', x: right, y: middleY },
+                { kind: 's', x: middleX, y: bottom },
+                { kind: 'w', x: left, y: middleY },
+            ];
+        }
+
+        function hitShapeHandle(shape, cell, tolerance) {
+            if (!shape || !cell) return null;
+            const slack = Number.isFinite(tolerance) ? Math.max(0, tolerance) : 0;
+            for (const handle of shapeHandles(shape)) {
+                if (Math.abs(cell.x - handle.x) <= slack && Math.abs(cell.y - handle.y) <= slack) {
+                    return handle.kind;
+                }
+            }
+            return null;
+        }
+
+        /** Move the dragged side/corner to the pointer, keeping the opposite one fixed. */
+        function resizeShape(shape, kind, cell) {
+            if (!shape || !cell) return shape;
+            if (shape.tool === 'line') {
+                return kind === 'p0'
+                    ? { ...shape, x0: cell.x, y0: cell.y }
+                    : { ...shape, x1: cell.x, y1: cell.y };
+            }
+            const bounds = shapeBounds(shape);
+            let left = bounds.x;
+            let top = bounds.y;
+            let right = bounds.x + bounds.w - 1;
+            let bottom = bounds.y + bounds.h - 1;
+            if (kind.indexOf('w') >= 0) left = cell.x;
+            if (kind.indexOf('e') >= 0) right = cell.x;
+            if (kind.indexOf('n') >= 0) top = cell.y;
+            if (kind.indexOf('s') >= 0) bottom = cell.y;
+            return normalizeShape({ ...shape, x0: left, y0: top, x1: right, y1: bottom });
+        }
+
+        function translateShape(shape, dx, dy) {
+            if (!shape) return shape;
+            return {
+                ...shape,
+                x0: shape.x0 + dx,
+                y0: shape.y0 + dy,
+                x1: shape.x1 + dx,
+                y1: shape.y1 + dy,
+            };
+        }
+
+        /** Shift: snap lines to 45° steps and rectangles/ellipses to a square. */
+        function constrainShape(shape) {
+            if (!shape) return shape;
+            const dx = shape.x1 - shape.x0;
+            const dy = shape.y1 - shape.y0;
+            if (shape.tool === 'line') {
+                if (dx === 0 && dy === 0) return shape;
+                const angle = Math.atan2(dy, dx);
+                const snapped = Math.round(angle / (Math.PI / 4)) * (Math.PI / 4);
+                const length = Math.hypot(dx, dy);
+                return {
+                    ...shape,
+                    x1: shape.x0 + Math.round(Math.cos(snapped) * length),
+                    y1: shape.y0 + Math.round(Math.sin(snapped) * length),
+                };
+            }
+            const size = Math.max(Math.abs(dx), Math.abs(dy));
+            return {
+                ...shape,
+                x1: shape.x0 + (dx < 0 ? -size : size),
+                y1: shape.y0 + (dy < 0 ? -size : size),
+            };
         }
 
         function hexToRgb(hex) {
@@ -1146,6 +1381,29 @@ window.__ModuleLoader__.load({
                     }),
                     h('path', { d: 'M13.2 10.4c1 1.2 1.5 2 1.5 2.6a1.5 1.5 0 0 1-3 0c0-.6.5-1.4 1.5-2.6z', fill: 'currentColor' }));
             }
+            if (name === 'line') {
+                return h('svg', common,
+                    h('path', {
+                        d: 'M3.4 12.6 12.6 3.4',
+                        fill: 'none', stroke: 'currentColor', strokeWidth: 1.5, strokeLinecap: 'round',
+                    }),
+                    h('circle', { cx: 3.2, cy: 12.8, r: 1.5, fill: 'currentColor' }),
+                    h('circle', { cx: 12.8, cy: 3.2, r: 1.5, fill: 'currentColor' }));
+            }
+            if (name === 'rect') {
+                return h('svg', common,
+                    h('rect', {
+                        x: 2.4, y: 3.2, width: 11.2, height: 9.6, rx: 0.6,
+                        fill: 'none', stroke: 'currentColor', strokeWidth: 1.4,
+                    }));
+            }
+            if (name === 'ellipse') {
+                return h('svg', common,
+                    h('ellipse', {
+                        cx: 8, cy: 8, rx: 5.8, ry: 4.8,
+                        fill: 'none', stroke: 'currentColor', strokeWidth: 1.4,
+                    }));
+            }
             if (name === 'select') {
                 return h('svg', common,
                     h('rect', {
@@ -1388,6 +1646,34 @@ window.__ModuleLoader__.load({
 }
 .pxs-selection-row {
   display: flex; flex-wrap: wrap; align-items: center; gap: 4px;
+}
+
+.pxs-shape-bar {
+  border-color: var(--dsw-alias-brand-primary, #4c8dff);
+}
+.pxs-switch-btn {
+  display: inline-flex; align-items: center; gap: 6px;
+}
+.pxs-switch-track {
+  position: relative; flex: 0 0 auto;
+  width: 26px; height: 14px; border-radius: 7px;
+  background: rgba(255, 255, 255, .22);
+  transition: background .14s ease;
+}
+.pxs-switch-btn[data-active="true"] .pxs-switch-track {
+  background: var(--dsw-alias-brand-primary, #4c8dff);
+}
+.pxs-switch-knob {
+  position: absolute; top: 2px; left: 2px;
+  width: 10px; height: 10px; border-radius: 50%;
+  background: #fff; transition: transform .14s ease;
+}
+.pxs-switch-btn[data-active="true"] .pxs-switch-knob {
+  transform: translateX(12px);
+}
+
+.pxs-shape-bar .pxs-selection-hint {
+  color: var(--dsw-alias-text-secondary, #8b93a1);
 }
 .pxs-selection-bar .pxs-btn { height: 24px; padding: 0 8px; font-size: 11px; }
 .pxs-selection-divider {
@@ -1879,6 +2165,10 @@ window.__ModuleLoader__.load({
             const [paletteImport, setPaletteImport] = useState(null);
             const [resizeDialog, setResizeDialog] = useState(null);
             const [selection, setSelection] = useState(null);
+            /** Pending shape preview: { tool, x0, y0, x1, y1 }. Written only on 确认. */
+            const [shape, setShape] = useState(null);
+            /** Per-tool fill switch: rect and ellipse each keep their own state. */
+            const [shapeFill, setShapeFill] = useState({ line: false, rect: false, ellipse: false });
             const [grabMode, setGrabMode] = useState(false);
             const [allLayersMode, setAllLayersMode] = useState(false);
             const [brandInk, setBrandInk] = useState(() => resolveBrandInk());
@@ -1940,6 +2230,12 @@ window.__ModuleLoader__.load({
             const selectionRef = useRef(null);
             /** In-flight selection drag: { mode, pointerId, start, origin }. */
             const selectDragRef = useRef(null);
+            /** Live shape preview, read by the pointer handlers and the paint loop. */
+            const shapeRef = useRef(null);
+            /** In-flight shape drag: { mode: 'create'|'move'|'resize', pointerId, … }. */
+            const shapeDragRef = useRef(null);
+            /** Mirror of shapeFill, read by the paint loop and commitShape. */
+            const shapeFillRef = useRef({ line: false, rect: false, ellipse: false });
             /** Indirection for the keyboard effect, which is registered before these callbacks exist. */
             const selectApiRef = useRef({});
             const grabRef = useRef(false);
@@ -1956,6 +2252,7 @@ window.__ModuleLoader__.load({
             if (allLayersRef.current !== allLayersMode) allLayersRef.current = allLayersMode;
             if (hideComposerRef.current !== hideComposer) hideComposerRef.current = hideComposer;
             if (autoFitRef.current !== autoFit) autoFitRef.current = autoFit;
+            if (shapeFillRef.current !== shapeFill) shapeFillRef.current = shapeFill;
             selectionRef.current = selection;
 
             docRef.current = doc;
@@ -2153,6 +2450,49 @@ window.__ModuleLoader__.load({
                     context.lineDashOffset = 4;
                     context.strokeStyle = 'rgba(255,255,255,0.95)';
                     context.strokeRect(boxX + 0.5, boxY + 0.5, boxW - 1, boxH - 1);
+                    context.restore();
+                }
+
+                const activeShape = shapeRef.current;
+                if (activeShape && SHAPE_TOOL_IDS.indexOf(toolRef.current) >= 0) {
+                    // Preview only: nothing here is in the document yet.
+                    const cellSize = Math.max(1, scale);
+                    const penColor = (doc && doc.palette[colorRef.current]) || '#ffffff';
+                    context.save();
+                    context.globalAlpha = 0.7;
+                    context.fillStyle = penColor;
+                    const previewCells = shapeFillRef.current[activeShape.tool] ? filledShapeCells(activeShape) : shapeCells(activeShape);
+                    for (const [x, y] of previewCells) {
+                        if (x < 0 || y < 0 || x >= docWidth || y >= docHeight) continue;
+                        context.fillRect(pan.x + x * cellSize, pan.y + y * cellSize, cellSize, cellSize);
+                    }
+                    context.restore();
+                    const box = shapeBounds(activeShape);
+                    const boxX = pan.x + box.x * cellSize;
+                    const boxY = pan.y + box.y * cellSize;
+                    const boxW = box.w * cellSize;
+                    const boxH = box.h * cellSize;
+                    context.save();
+                    context.lineWidth = 1;
+                    context.setLineDash([4, 4]);
+                    context.strokeStyle = 'rgba(0,0,0,0.8)';
+                    context.strokeRect(boxX + 0.5, boxY + 0.5, boxW - 1, boxH - 1);
+                    context.lineDashOffset = 4;
+                    context.strokeStyle = 'rgba(255,255,255,0.95)';
+                    context.strokeRect(boxX + 0.5, boxY + 0.5, boxW - 1, boxH - 1);
+                    context.restore();
+                    context.save();
+                    context.lineWidth = 1;
+                    context.strokeStyle = 'rgba(0,0,0,0.85)';
+                    context.fillStyle = '#ffffff';
+                    for (const handle of shapeHandles(activeShape)) {
+                        const hx = pan.x + handle.x * cellSize + cellSize / 2;
+                        const hy = pan.y + handle.y * cellSize + cellSize / 2;
+                        context.beginPath();
+                        context.rect(hx - 3.5, hy - 3.5, 7, 7);
+                        context.fill();
+                        context.stroke();
+                    }
                     context.restore();
                 }
 
@@ -2531,6 +2871,52 @@ window.__ModuleLoader__.load({
                 cancelSelection();
             }, [cancelSelection]);
 
+            /** Drops the shape preview: nothing was written, so cancelling is free. */
+            const cancelShape = useCallback(() => {
+                shapeDragRef.current = null;
+                if (!shapeRef.current) return;
+                shapeRef.current = null;
+                setShape(null);
+                requestPaint();
+            }, [requestPaint]);
+
+            /**
+             * Writes the preview into the active layer as a single undoable step.
+             * The preview lives outside the document, so this is the only path a
+             * shape can take into the artwork.
+             */
+            const commitShape = useCallback(() => {
+                const pending = shapeRef.current;
+                const current = docRef.current;
+                shapeDragRef.current = null;
+                if (!pending || !current) {
+                    cancelShape();
+                    return;
+                }
+                const layer = current.layers[layerRef.current];
+                shapeRef.current = null;
+                setShape(null);
+                if (!layer) {
+                    requestPaint();
+                    return;
+                }
+                const pen = charFor(colorRef.current);
+                const rows = layer.rows.slice();
+                let painted = 0;
+                const pendingCells = shapeFillRef.current[pending.tool] ? filledShapeCells(pending) : shapeCells(pending);
+                for (const [x, y] of pendingCells) {
+                    if (x < 0 || y < 0 || x >= current.w || y >= current.h) continue;
+                    rows[y] = rows[y].slice(0, x) + pen + rows[y].slice(x + 1);
+                    painted += 1;
+                }
+                if (painted === 0) {
+                    requestPaint();
+                    return;
+                }
+                commitRows(rows);
+                setNotice(`已画出${SHAPE_LABELS[pending.tool] || '形状'}：${painted} 个像素`);
+            }, [cancelShape, commitRows, requestPaint]);
+
             /** Lifts the selected pixels out of their layers; false when nothing could be lifted. */
             const liftSelection = useCallback((allLayers) => {
                 const current = docRef.current;
@@ -2750,6 +3136,17 @@ window.__ModuleLoader__.load({
                 interruptSelection();
             }, [editing, importDialog, interruptSelection, newDialog, paletteImport, saveDialog]);
 
+            // A preview belongs to one tool, colour, layer and document: switching any
+            // of them drops it instead of writing it somewhere unexpected.
+            useEffect(() => {
+                cancelShape();
+            }, [brush, cancelShape, colorIndex, doc, editing, importDialog, layerIndex, newDialog, paletteImport, saveDialog, tool]);
+
+            // Toggling fill only changes how the preview is drawn, so repaint it.
+            useEffect(() => {
+                if (shapeRef.current) requestPaint();
+            }, [requestPaint, shapeFill]);
+
             const onPointerDown = useCallback((event) => {
                 if (!docRef.current) return;
                 const wantsPan = event.button === 1 || spaceRef.current || event.altKey;
@@ -2769,6 +3166,57 @@ window.__ModuleLoader__.load({
                 const cell = cellFromEvent(event);
                 if (!cell) return;
                 const current = docRef.current;
+
+                if (SHAPE_TOOL_IDS.indexOf(toolRef.current) >= 0) {
+                    if (cell.x < 0 || cell.y < 0 || cell.x >= current.w || cell.y >= current.h) {
+                        // Beside the artwork there is nothing to shape.
+                        cancelShape();
+                        return;
+                    }
+                    event.preventDefault();
+                    interruptSelection();
+                    const pending = shapeRef.current;
+                    const scale = scaleRef.current;
+                    const tolerance = Math.max(0, Math.round(4 / Math.max(0.5, scale)));
+                    if (pending) {
+                        const kind = hitShapeHandle(pending, cell, tolerance);
+                        if (kind) {
+                            event.currentTarget.setPointerCapture(event.pointerId);
+                            shapeDragRef.current = { mode: 'resize', kind, pointerId: event.pointerId };
+                            requestPaint();
+                            return;
+                        }
+                        if (pointInRectangle(shapeBounds(pending), cell)) {
+                            event.currentTarget.setPointerCapture(event.pointerId);
+                            shapeDragRef.current = {
+                                mode: 'move',
+                                pointerId: event.pointerId,
+                                start: { x: cell.x, y: cell.y },
+                                origin: pending,
+                            };
+                            requestPaint();
+                            return;
+                        }
+                    }
+                    event.currentTarget.setPointerCapture(event.pointerId);
+                    const draft = {
+                        tool: toolRef.current,
+                        x0: cell.x,
+                        y0: cell.y,
+                        x1: cell.x,
+                        y1: cell.y,
+                    };
+                    shapeDragRef.current = {
+                        mode: 'create',
+                        pointerId: event.pointerId,
+                        tool: toolRef.current,
+                        origin: { x: cell.x, y: cell.y },
+                    };
+                    shapeRef.current = draft;
+                    setShape(draft);
+                    requestPaint();
+                    return;
+                }
 
                 if (toolRef.current === 'select') {
                     if (cell.x < 0 || cell.y < 0 || cell.x >= current.w || cell.y >= current.h) {
@@ -2841,7 +3289,7 @@ window.__ModuleLoader__.load({
                 strokeRef.current = { pointerId: event.pointerId, last: cell };
                 event.currentTarget.setPointerCapture(event.pointerId);
                 strokeAt(cell, null);
-            }, [cellFromEvent, commitRows, interruptSelection, pickColorAt, requestPaint, strokeAt]);
+            }, [cancelShape, cellFromEvent, commitRows, interruptSelection, pickColorAt, requestPaint, strokeAt]);
 
             const onPointerMove = useCallback((event) => {
                 const panDraw = panDrawRef.current;
@@ -2853,6 +3301,41 @@ window.__ModuleLoader__.load({
                     requestPaint();
                     return;
                 }
+                const shapeDrag = shapeDragRef.current;
+                if (shapeDrag && shapeDrag.pointerId === event.pointerId) {
+                    const current = docRef.current;
+                    const cell = cellFromEvent(event);
+                    if (!current || !cell) return;
+                    const target = {
+                        x: clamp(cell.x, 0, Math.max(0, current.w - 1)),
+                        y: clamp(cell.y, 0, Math.max(0, current.h - 1)),
+                    };
+                    const pending = shapeRef.current;
+                    if (shapeDrag.mode === 'create') {
+                        const draft = {
+                            tool: shapeDrag.tool,
+                            x0: shapeDrag.origin.x,
+                            y0: shapeDrag.origin.y,
+                            x1: target.x,
+                            y1: target.y,
+                        };
+                        shapeRef.current = event.shiftKey ? constrainShape(draft) : draft;
+                    } else if (pending && shapeDrag.mode === 'resize') {
+                        shapeRef.current = resizeShape(pending, shapeDrag.kind, target);
+                    } else if (pending && shapeDrag.mode === 'move') {
+                        shapeRef.current = translateShape(
+                            shapeDrag.origin,
+                            target.x - shapeDrag.start.x,
+                            target.y - shapeDrag.start.y,
+                        );
+                    } else {
+                        return;
+                    }
+                    setShape(shapeRef.current);
+                    requestPaint();
+                    return;
+                }
+
                 const selectDrag = selectDragRef.current;
                 if (selectDrag && selectDrag.pointerId === event.pointerId) {
                     const current = docRef.current;
@@ -2897,6 +3380,27 @@ window.__ModuleLoader__.load({
             }, [cellFromEvent, requestPaint, strokeAt]);
 
             const onPointerUp = useCallback((event) => {
+                const shapeDrag = shapeDragRef.current;
+                if (shapeDrag && shapeDrag.pointerId === event.pointerId) {
+                    shapeDragRef.current = null;
+                    const pending = shapeRef.current;
+                    if (pending) {
+                        const settled = normalizeShape(pending);
+                        shapeRef.current = settled;
+                        setShape(settled);
+                    }
+                    const canvas = event.currentTarget;
+                    if (canvas && typeof canvas.releasePointerCapture === 'function') {
+                        try {
+                            canvas.releasePointerCapture(event.pointerId);
+                        } catch {
+                            /* capture is best effort */
+                        }
+                    }
+                    requestPaint();
+                    return;
+                }
+
                 const selectDrag = selectDragRef.current;
                 if (selectDrag && selectDrag.pointerId === event.pointerId) {
                     selectDragRef.current = null;
@@ -3193,6 +3697,18 @@ window.__ModuleLoader__.load({
                         return;
                     }
                     const key = event.key.toLowerCase();
+                    if (shapeRef.current) {
+                        if (key === 'enter') {
+                            event.preventDefault();
+                            commitShape();
+                            return;
+                        }
+                        if (key === 'escape') {
+                            event.preventDefault();
+                            cancelShape();
+                            return;
+                        }
+                    }
                     if (key === 'escape') {
                         selectApiRef.current.cancel();
                         return;
@@ -3232,6 +3748,9 @@ window.__ModuleLoader__.load({
                     else if (key === 'g') setTool('bucket');
                     else if (key === 'i') setTool('picker');
                     else if (key === 'm') setTool('select');
+                    else if (key === 'l') setTool('line');
+                    else if (key === 'r') setTool('rect');
+                    else if (key === 'o') setTool('ellipse');
                     else if (key === 'f') fitToView();
                     else if (key === 'h') {
                         const next = !gridRef.current;
@@ -3262,7 +3781,7 @@ window.__ModuleLoader__.load({
                     window.removeEventListener('keydown', onKeyDown);
                     window.removeEventListener('keyup', onKeyUp);
                 };
-            }, [fitToView, redo, requestPaint, saveNow, undo, zoomStep]);
+            }, [cancelShape, commitShape, fitToView, redo, requestPaint, saveNow, undo, zoomStep]);
 
             useEffect(() => {
                 const close = () => setMenu(null);
@@ -4337,7 +4856,7 @@ window.__ModuleLoader__.load({
 
             const toolsSection = h('div', { className: 'pxs-section' },
                 h('p', { className: 'pxs-title' }, '工具'),
-                h('div', { className: 'pxs-row' }, TOOLS.map((entry) => h('button', {
+                h('div', { className: 'pxs-row' }, [...TOOLS, ...SHAPE_TOOLS].map((entry) => h('button', {
                     key: entry.id,
                     className: 'pxs-btn pxs-btn-icon',
                     title: `${entry.label} (${entry.key})`,
@@ -4500,6 +5019,31 @@ window.__ModuleLoader__.load({
 
             const loadingNode = loading ? h('div', { className: 'pxs-empty' }, h('p', null, '加载作品中…')) : null;
 
+            const shapeBar = shape ? h('div', { className: 'pxs-selection-bar pxs-shape-bar' },
+                h('div', { className: 'pxs-selection-row' },
+                    h('span', { className: 'pxs-selection-label' },
+                        `${SHAPE_LABELS[shape.tool] || '形状'} ${Math.abs(shape.x1 - shape.x0) + 1}×${Math.abs(shape.y1 - shape.y0) + 1}`),
+                    shape.tool === 'line' ? null : h('button', {
+                        className: 'pxs-btn pxs-switch-btn',
+                        role: 'switch',
+                        'aria-checked': Boolean(shapeFill[shape.tool]),
+                        'data-active': Boolean(shapeFill[shape.tool]),
+                        title: '确认时把这个形状的内部也填满（矩形与椭圆各自独立）',
+                        onClick: () => setShapeFill((value) => ({ ...value, [shape.tool]: !value[shape.tool] })),
+                    }, h('span', { className: 'pxs-switch-track' }, h('span', { className: 'pxs-switch-knob' })), '是否填充'),
+                    h('button', {
+                        className: 'pxs-btn pxs-btn-primary',
+                        title: '写入图层 (Enter)',
+                        onClick: commitShape,
+                    }, '✓ 确认'),
+                    h('button', {
+                        className: 'pxs-btn',
+                        title: '放弃这个形状 (Esc)',
+                        onClick: cancelShape,
+                    }, '✕ 取消')),
+                h('div', { className: 'pxs-selection-hint' },
+                    '拖动手柄调整宽高 · 框内拖动整体移动 · 按住 Shift 约束（45° 直线 / 正方形）')) : null;
+
             const selectionBar = selection ? h('div', { className: 'pxs-selection-bar' },
                 h('div', { className: 'pxs-selection-row' },
                     h('span', { className: 'pxs-selection-label' },
@@ -4567,7 +5111,7 @@ window.__ModuleLoader__.load({
                     '拖动 = 移动选框　·　Shift + 拖动 = 搬走像素　·　剪切 = 内容留在画布上跟随选框　·　方向键 = 微调（Shift 10px）　·　Esc = 取消还原')) : null;
 
             const stageNode = h('div', { className: 'pxs-stage', ref: stageRef },
-                canvasNode, emptyNode, loadingNode, selectionBar);
+                canvasNode, emptyNode, loadingNode, shapeBar, selectionBar);
 
             const colorSection = h('div', { className: 'pxs-section' },
                 h('p', { className: 'pxs-title' }, '当前颜色'),
@@ -5258,6 +5802,22 @@ window.__ModuleLoader__.load({
                 restoreShellHandles,
                 selector: SHELL_HANDLE_SELECTOR,
                 composerSelector: SHELL_COMPOSER_SELECTOR,
+            };
+
+            window.__PXS_TEST__.shape = {
+                tools: SHAPE_TOOL_IDS,
+                normalizeShape,
+                rectCells,
+                ellipseCells,
+                shapeCells,
+                filledShapeCells,
+                shapeBounds,
+                shapeHandles,
+                hitShapeHandle,
+                resizeShape,
+                translateShape,
+                constrainShape,
+                lineCells,
             };
         }
 

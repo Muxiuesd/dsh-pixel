@@ -545,6 +545,103 @@ same('trimming leaves shorter palettes alone',
     trimRowsToPalette([{ name: 'a', visible: true, rows: ['012'] }], 8)[0].rows[0],
     '012');
 
+/* shape tools ------------------------------------------------------------- */
+
+const shapeApi = windowStub.__PXS_TEST__.shape;
+same("the shape hook is installed", Boolean(shapeApi), true);
+
+function sortedCells(cells) {
+    return cells.map(([x, y]) => `${x},${y}`).sort();
+}
+
+same("the shape tool ids are listed", shapeApi.tools, ["line", "rect", "ellipse"]);
+same("a horizontal line covers every cell", sortedCells(shapeApi.lineCells(0, 0, 3, 0)), ["0,0", "1,0", "2,0", "3,0"]);
+same("a 45 degree line steps one cell at a time", shapeApi.lineCells(0, 0, 3, 3).length, 4);
+same("a rectangle traces its outline only", shapeApi.rectCells(0, 0, 4, 3).length, 14);
+same("a rectangle keeps its corners",
+    sortedCells(shapeApi.rectCells(0, 0, 4, 3)).filter((key) => ["0,0", "4,0", "0,3", "4,3"].includes(key)).length,
+    4);
+
+const circle = shapeApi.ellipseCells(0, 0, 8, 8);
+same("the ellipse stays inside its box",
+    circle.every(([x, y]) => x >= 0 && x <= 8 && y >= 0 && y <= 8),
+    true);
+same("the ellipse has no gaps",
+    circle.every(([x, y], index) => {
+        if (index === 0) return true;
+        const [px, py] = circle[index - 1];
+        return Math.abs(x - px) <= 1 && Math.abs(y - py) <= 1;
+    }),
+    true);
+same("the ellipse closes the loop", (() => {
+    const [fx, fy] = circle[0];
+    const [lx, ly] = circle[circle.length - 1];
+    return Math.abs(fx - lx) <= 1 && Math.abs(fy - ly) <= 1;
+})(), true);
+
+same("rectangles normalise to left and top first",
+    shapeApi.normalizeShape({ tool: "rect", x0: 5, y0: 4, x1: 2, y1: 1 }),
+    { tool: "rect", x0: 2, y0: 1, x1: 5, y1: 4 });
+same("lines keep their direction",
+    shapeApi.normalizeShape({ tool: "line", x0: 5, y0: 4, x1: 2, y1: 1 }),
+    { tool: "line", x0: 5, y0: 4, x1: 2, y1: 1 });
+same("bounds follow the shape",
+    shapeApi.shapeBounds({ tool: "line", x0: 5, y0: 5, x1: 2, y1: 2 }),
+    { x: 2, y: 2, w: 4, h: 4 });
+
+const rectHandles = shapeApi.shapeHandles({ tool: "rect", x0: 0, y0: 0, x1: 4, y1: 3 });
+same("a rectangle offers eight handles", rectHandles.length, 8);
+same("the top-left handle sits on the corner",
+    rectHandles.find((handle) => handle.kind === "nw"), { kind: "nw", x: 0, y: 0 });
+same("the bottom-right handle sits on the corner",
+    rectHandles.find((handle) => handle.kind === "se"), { kind: "se", x: 4, y: 3 });
+same("a line offers two endpoints",
+    shapeApi.shapeHandles({ tool: "line", x0: 1, y0: 2, x1: 7, y1: 5 }).length, 2);
+
+const handleBox = { tool: "rect", x0: 0, y0: 0, x1: 4, y1: 3 };
+same("a handle is hit exactly", shapeApi.hitShapeHandle(handleBox, { x: 4, y: 3 }, 0), "se");
+same("a corner handle beats the edge handle next to it", shapeApi.hitShapeHandle(handleBox, { x: 4, y: 2 }, 1), "se");
+same("nothing far away is hit", shapeApi.hitShapeHandle(handleBox, { x: 2, y: 2 }, 0), null);
+
+same("dragging the corner keeps the opposite one",
+    shapeApi.resizeShape(handleBox, "se", { x: 6, y: 5 }),
+    { tool: "rect", x0: 0, y0: 0, x1: 6, y1: 5 });
+same("dragging the top edge only moves it",
+    shapeApi.resizeShape(handleBox, "n", { x: 2, y: 2 }),
+    { tool: "rect", x0: 0, y0: 2, x1: 4, y1: 3 });
+same("a rectangle can be dragged whole",
+    shapeApi.translateShape(handleBox, 2, -1),
+    { tool: "rect", x0: 2, y0: -1, x1: 6, y1: 2 });
+
+same("shift snaps a shallow line to horizontal",
+    shapeApi.constrainShape({ tool: "line", x0: 0, y0: 0, x1: 10, y1: 1 }),
+    { tool: "line", x0: 0, y0: 0, x1: 10, y1: 0 });
+same("shift squares a rectangle",
+    shapeApi.constrainShape({ tool: "rect", x0: 0, y0: 0, x1: 10, y1: 3 }),
+    { tool: "rect", x0: 0, y0: 0, x1: 10, y1: 10 });
+
+// Filled variants: the interior joins the outline, without duplicates.
+const filledRect = shapeApi.filledShapeCells({ tool: 'rect', x0: 0, y0: 0, x1: 4, y1: 3 });
+same('a filled rectangle covers every cell', filledRect.length, 5 * 4);
+same('a filled rectangle has no duplicates', new Set(filledRect.map(([x, y]) => `${x},${y}`)).size, filledRect.length);
+truthy('a filled rectangle keeps its corners',
+    filledRect.some(([x, y]) => x === 0 && y === 0) && filledRect.some(([x, y]) => x === 4 && y === 3));
+truthy('a filled rectangle covers the middle', filledRect.some(([x, y]) => x === 2 && y === 1));
+same('a filled line is just the line',
+    shapeApi.filledShapeCells({ tool: 'line', x0: 1, y0: 2, x1: 4, y1: 2 }),
+    shapeApi.lineCells(1, 2, 4, 2));
+const ellipseOutline = shapeApi.ellipseCells(0, 0, 8, 8);
+const ellipseFilled = shapeApi.filledShapeCells({ tool: 'ellipse', x0: 0, y0: 0, x1: 8, y1: 8 });
+truthy('a filled ellipse covers more than its outline', ellipseFilled.length > ellipseOutline.length);
+truthy('a filled ellipse keeps every outline cell',
+    ellipseOutline.every(([x, y]) => ellipseFilled.some(([fx, fy]) => fx === x && fy === y)));
+truthy('a filled ellipse stays inside its box',
+    ellipseFilled.every(([x, y]) => x >= 0 && y >= 0 && x <= 8 && y <= 8));
+truthy('a filled ellipse covers its centre', ellipseFilled.some(([x, y]) => x === 4 && y === 4));
+same('a filled ellipse has no duplicates', new Set(ellipseFilled.map(([x, y]) => `${x},${y}`)).size, ellipseFilled.length);
+truthy('a one-cell ellipse still paints something',
+    shapeApi.filledShapeCells({ tool: 'ellipse', x0: 3, y0: 3, x1: 3, y1: 3 }).length > 0);
+
 if (failures > 0) {
     console.error(`FAIL: ${failures} selection assertion(s) failed`);
     process.exit(1);
