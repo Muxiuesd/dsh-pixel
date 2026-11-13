@@ -297,31 +297,92 @@ window.__ModuleLoader__.load({
             return cells;
         }
 
+        /** Inclusive [lo, hi] horizontal span of a solid ellipse, one entry per row. */
+        function ellipseSpans(left, top, right, bottom) {
+            const centreX = (left + right) / 2;
+            const centreY = (top + bottom) / 2;
+            const radiusX = (right - left) / 2;
+            const radiusY = (bottom - top) / 2;
+            const spans = [];
+            for (let y = top; y <= bottom; y += 1) {
+                const ratio = radiusY === 0 ? (y === centreY ? 0 : 2) : (y - centreY) / radiusY;
+                if (Math.abs(ratio) > 1) {
+                    spans.push(null);
+                    continue;
+                }
+                const half = radiusX * Math.sqrt(Math.max(0, 1 - ratio * ratio));
+                spans.push([Math.round(centreX - half), Math.round(centreX + half)]);
+            }
+            return spans;
+        }
+
         /**
-         * Dense parametric sampling: at eight samples per cell the rounded points
-         * stay 8-connected, so the outline has no gaps even for tiny ellipses.
+         * Midpoint ellipse (Zingl's bounding-box form): walk one octant and paint all
+         * four quadrants. The ring is symmetric by construction and exactly one cell
+         * thick — sampling the curve instead doubles up wherever it turns steep, which
+         * is what reads as a two-pixel edge on the diagonal of a circle.
          */
         function ellipseCells(x0, y0, x1, y1) {
             const left = Math.min(x0, x1);
             const right = Math.max(x0, x1);
             const top = Math.min(y0, y1);
             const bottom = Math.max(y0, y1);
-            const centreX = (left + right) / 2;
-            const centreY = (top + bottom) / 2;
-            const radiusX = (right - left) / 2;
-            const radiusY = (bottom - top) / 2;
-            if (radiusX === 0 && radiusY === 0) return [[left, top]];
-            const steps = Math.max(24, Math.ceil(Math.PI * 2 * Math.max(radiusX, radiusY) * 4));
-            const seen = new Set();
             const cells = [];
-            for (let step = 0; step < steps; step += 1) {
-                const angle = (step / steps) * Math.PI * 2;
-                const x = Math.round(centreX + radiusX * Math.cos(angle));
-                const y = Math.round(centreY + radiusY * Math.sin(angle));
+            const seen = new Set();
+            const push = (x, y) => {
                 const key = `${x},${y}`;
-                if (seen.has(key)) continue;
+                if (seen.has(key)) return;
                 seen.add(key);
                 cells.push([x, y]);
+            };
+            if (left === right && top === bottom) return [[left, top]];
+            if (left === right) {
+                for (let y = top; y <= bottom; y += 1) push(left, y);
+                return cells;
+            }
+            if (top === bottom) {
+                for (let x = left; x <= right; x += 1) push(x, top);
+                return cells;
+            }
+            let a = right - left;
+            let b = bottom - top;
+            const oddHeight = b & 1;
+            let dx = 4 * (1 - a) * b * b;
+            let dy = 4 * (oddHeight + 1) * a * a;
+            let err = dx + dy + oddHeight * a * a;
+            let xa = left;
+            let xb = right;
+            let ya = top + Math.floor((b + 1) / 2);
+            let yb = ya - oddHeight;
+            a *= 8 * a;
+            const bDouble = 8 * b * b;
+            do {
+                push(xb, ya);
+                push(xa, ya);
+                push(xa, yb);
+                push(xb, yb);
+                const doubled = 2 * err;
+                if (doubled <= dy) {
+                    ya += 1;
+                    yb -= 1;
+                    dy += a;
+                    err += dy;
+                }
+                if (doubled >= dx || 2 * err > dy) {
+                    xa += 1;
+                    xb -= 1;
+                    dx += bDouble;
+                    err += dx;
+                }
+            } while (xa <= xb);
+            // Very flat ellipses stop the loop early; finish the caps by hand.
+            while (ya - yb < b) {
+                push(xa - 1, ya);
+                push(xb + 1, ya);
+                ya += 1;
+                push(xa - 1, yb);
+                push(xb + 1, yb);
+                yb -= 1;
             }
             return cells;
         }
@@ -335,9 +396,10 @@ window.__ModuleLoader__.load({
 
         /**
          * Solid cells for a shape. A line has no inside, so filling it is a no-op.
-         * The ellipse rows are computed from the ellipse equation (a scanline fill)
-         * and then unioned with the sampled outline, because rounding can put an
-         * outline cell just outside the scanline span.
+         * The ellipse rows come from the ellipse equation (a scanline fill), then get
+         * clamped to the outline's own extent on that row: the ring is drawn from the
+         * midpoint walk and sits a cell inside the curve where it turns steep, so an
+         * unclamped scanline would poke out past the border by one pixel.
          */
         function filledShapeCells(shape) {
             if (!shape) return [];
@@ -360,17 +422,27 @@ window.__ModuleLoader__.load({
                 }
                 return cells;
             }
-            const centreX = (left + right) / 2;
-            const centreY = (top + bottom) / 2;
-            const radiusX = (right - left) / 2;
-            const radiusY = (bottom - top) / 2;
-            for (let y = top; y <= bottom; y += 1) {
-                const ratio = radiusY === 0 ? (y === centreY ? 0 : 2) : (y - centreY) / radiusY;
-                if (Math.abs(ratio) > 1) continue;
-                const half = radiusX * Math.sqrt(Math.max(0, 1 - ratio * ratio));
-                for (let x = Math.round(centreX - half); x <= Math.round(centreX + half); x += 1) push(x, y);
+            const outline = ellipseCells(left, top, right, bottom);
+            const extent = new Map();
+            for (const [x, y] of outline) {
+                const row = extent.get(y);
+                if (!row) {
+                    extent.set(y, [x, x]);
+                    continue;
+                }
+                if (x < row[0]) row[0] = x;
+                if (x > row[1]) row[1] = x;
             }
-            for (const [x, y] of ellipseCells(left, top, right, bottom)) push(x, y);
+            const spans = ellipseSpans(left, top, right, bottom);
+            for (let y = top; y <= bottom; y += 1) {
+                const span = spans[y - top];
+                const row = extent.get(y);
+                if (!span || !row) continue;
+                const lo = Math.max(span[0], row[0]);
+                const hi = Math.min(span[1], row[1]);
+                for (let x = lo; x <= hi; x += 1) push(x, y);
+            }
+            for (const [x, y] of outline) push(x, y);
             return cells;
         }
 
@@ -2394,7 +2466,6 @@ window.__ModuleLoader__.load({
                     context.beginPath();
                     context.rect(pan.x, pan.y, docWidth, docHeight);
                     context.clip();
-                    context.strokeStyle = 'rgba(255,255,255,0.09)';
                     context.lineWidth = 1;
                     // Skip grid lines that sit outside the visible stage.
                     const firstCol = Math.max(1, Math.floor((0 - pan.x) / scale));
@@ -2412,6 +2483,16 @@ window.__ModuleLoader__.load({
                         context.moveTo(pan.x, py);
                         context.lineTo(pan.x + docWidth, py);
                     }
+                    // Adaptive grid: a single stroke colour disappears either on light or
+                    // on dark artwork. Two blend passes colour the same path per pixel —
+                    // "darken" pulls a dark line out of the light cells, "lighten" pushes a
+                    // light line over the dark ones — so the grid keeps its contrast without
+                    // walking every cell, which keeps a 2048 canvas at 4x fast.
+                    context.globalCompositeOperation = 'darken';
+                    context.strokeStyle = 'rgba(0, 0, 0, 0.34)';
+                    context.stroke();
+                    context.globalCompositeOperation = 'lighten';
+                    context.strokeStyle = 'rgba(255, 255, 255, 0.3)';
                     context.stroke();
                     context.restore();
                 }
@@ -2475,11 +2556,13 @@ window.__ModuleLoader__.load({
                     context.save();
                     context.lineWidth = 1;
                     context.setLineDash([4, 4]);
+                    // Sit just outside the painted cells: overlapping the outline would
+                    // read as a second pixel row on the edge.
                     context.strokeStyle = 'rgba(0,0,0,0.8)';
-                    context.strokeRect(boxX + 0.5, boxY + 0.5, boxW - 1, boxH - 1);
+                    context.strokeRect(boxX - 0.5, boxY - 0.5, boxW + 1, boxH + 1);
                     context.lineDashOffset = 4;
                     context.strokeStyle = 'rgba(255,255,255,0.95)';
-                    context.strokeRect(boxX + 0.5, boxY + 0.5, boxW - 1, boxH - 1);
+                    context.strokeRect(boxX - 0.5, boxY - 0.5, boxW + 1, boxH + 1);
                     context.restore();
                     context.save();
                     context.lineWidth = 1;
@@ -2894,12 +2977,14 @@ window.__ModuleLoader__.load({
                     return;
                 }
                 const layer = current.layers[layerRef.current];
-                shapeRef.current = null;
-                setShape(null);
-                if (!layer) {
+                if (!layer || layer.visible === false) {
+                    // Keep the preview: the user can unhide the layer and confirm again.
+                    if (layer) setNotice('当前图层已隐藏，点亮小眼睛再确认');
                     requestPaint();
                     return;
                 }
+                shapeRef.current = null;
+                setShape(null);
                 const pen = charFor(colorRef.current);
                 const rows = layer.rows.slice();
                 let painted = 0;
@@ -3268,6 +3353,13 @@ window.__ModuleLoader__.load({
                     return;
                 }
                 if (cell.x < 0 || cell.y < 0 || cell.x >= current.w || cell.y >= current.h) return;
+
+                // Painting into a hidden layer looks like nothing happens, so say so first.
+                const paintingLayer = current.layers[layerRef.current];
+                if (paintingLayer && paintingLayer.visible === false) {
+                    setNotice('当前图层已隐藏，点亮小眼睛再画');
+                    return;
+                }
 
                 if (toolRef.current === 'bucket') {
                     const rows = fillRegion(
@@ -4492,10 +4584,15 @@ window.__ModuleLoader__.load({
                     return;
                 }
                 const at = Math.min(current.layers.length, Math.max(1, layerRef.current + 1));
+                // Layer order shifts below a running selection, so end it before touching the list.
+                interruptSelection();
                 const base = snapshotLayers();
+                const used = new Set(base.layers.map((layer) => layer.name));
+                let serial = base.layers.length + 1;
+                while (used.has(`图层 ${serial}`)) serial += 1;
                 const layers = base.layers.slice();
                 layers.splice(at, 0, {
-                    name: `图层 ${base.layers.length + 1}`.slice(0, 60),
+                    name: `图层 ${serial}`.slice(0, 60),
                     visible: true,
                     rows: blankRows(base.w, base.h),
                 });
@@ -4511,6 +4608,7 @@ window.__ModuleLoader__.load({
                     setNotice('至少要保留一个图层');
                     return;
                 }
+                interruptSelection();
                 const base = snapshotLayers();
                 const layers = base.layers.filter((_, position) => position !== index);
                 writeLayers(base, layers);
@@ -4521,6 +4619,7 @@ window.__ModuleLoader__.load({
             const toggleLayerVisible = (index) => {
                 const current = docRef.current;
                 if (!current || !current.layers[index]) return;
+                interruptSelection();
                 const base = snapshotLayers();
                 const layers = base.layers.map((layer, position) => (
                     position === index ? { ...layer, visible: layer.visible === false } : layer
@@ -4533,6 +4632,7 @@ window.__ModuleLoader__.load({
                 if (!current) return;
                 const to = index + delta;
                 if (to < 0 || to >= current.layers.length) return;
+                interruptSelection();
                 const base = snapshotLayers();
                 const layers = base.layers.slice();
                 const moved = layers.splice(index, 1)[0];
@@ -4548,6 +4648,7 @@ window.__ModuleLoader__.load({
                     setNotice(`最多 ${MAX_LAYERS} 个图层`);
                     return;
                 }
+                interruptSelection();
                 const base = snapshotLayers();
                 const layers = base.layers.slice();
                 const source = layers[index];
@@ -4564,6 +4665,7 @@ window.__ModuleLoader__.load({
             const mergeLayerDown = (index) => {
                 const current = docRef.current;
                 if (!current || index <= 0 || !current.layers[index]) return;
+                interruptSelection();
                 const base = snapshotLayers();
                 const layers = base.layers.slice();
                 const upper = layers[index];
@@ -4584,7 +4686,9 @@ window.__ModuleLoader__.load({
                 });
                 writeLayers(base, layers);
                 selectLayer(index - 1);
-                setNotice('已向下合并');
+                setNotice(lower.visible === false && upper.visible === false
+                    ? '已向下合并（两层原本都隐藏，合并结果仍然隐藏）'
+                    : '已向下合并');
             };
 
             const startRename = (index) => {

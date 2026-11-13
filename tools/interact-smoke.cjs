@@ -792,6 +792,14 @@ function loadModule() {
         && JSON.stringify(defaultWork.layers[0].rows) === JSON.stringify(paintedRows),
         `${defaultWork.palette.length} / ${defaultWork.layers[0].rows[0]}`);
 
+    // 17. the grid lines adapt to the artwork under them
+    check('the grid strokes a dark line for light cells',
+        clientSource.includes("context.globalCompositeOperation = 'darken'"));
+    check('the grid strokes a light line for dark cells',
+        clientSource.includes("context.globalCompositeOperation = 'lighten'"));
+    check('the grid no longer uses one flat stroke colour',
+        !clientSource.includes("context.strokeStyle = 'rgba(255,255,255,0.09)'"));
+
     console.log(failures === 0 ? 'PASS: interaction flow works end to end' : `FAIL: ${failures} check(s) failed`);
     process.exit(failures === 0 ? 0 : 1);
 })().catch((error) => {

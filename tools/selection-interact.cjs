@@ -1209,6 +1209,62 @@ function loadModule() {
     check('cancelling a shape leaves the pixels untouched',
         JSON.stringify(rows()) === JSON.stringify(hollowRows));
 
+    /* 21. layers: names, the hidden-layer guard, selection interrupts */
+
+    const byTitleStrict = (title) => findAll((node) => node.props.title === title);
+    const clickTitle = async (title, step) => {
+        const button = byTitleStrict(title)[0];
+        if (!button) throw new Error(`button ${title} missing`);
+        button.props.onClick({ preventDefault() {}, stopPropagation() {} });
+        await pump(step);
+    };
+    const layerName = () => {
+        const node = byClass('pxs-layer-name')[0];
+        return node ? textOf(node).trim() : '';
+    };
+
+    await clickTitle('新建图层', 'layer-add-1');
+    await clickTitle('新建图层', 'layer-add-2');
+    check('a new layer gets a fresh number', layerName() === '图层 3', layerName());
+    await clickTitle('删除当前图层', 'layer-delete');
+    check('deleting the top layer selects the one below', layerName() === '图层 2', layerName());
+    await clickTitle('新建图层', 'layer-add-3');
+    const layerNames = byClass('pxs-layer-name').map((node) => textOf(node).trim());
+    check('layer names stay unique after add/delete/add',
+        layerNames.length === new Set(layerNames).size && layerNames.indexOf('图层 3') >= 0,
+        layerNames.join(' / '));
+
+    key('b');
+    await pump('layer-pencil');
+    const beforeHidden = JSON.stringify(rows());
+    const eye = byClass('pxs-layer-eye')[0];
+    check('the layer list shows an eye per layer', Boolean(eye));
+    if (eye) eye.props.onClick({ stopPropagation() {} });
+    await pump('layer-hide');
+    pointerAt('onPointerDown', 2, 2);
+    pointerAt('onPointerMove', 4, 2);
+    pointerAt('onPointerUp', 4, 2);
+    await pump('layer-hidden-brush');
+    check('a hidden layer refuses the brush', JSON.stringify(rows()) === beforeHidden);
+    check('and the status line says why', /隐藏/.test(noticeText()), noticeText());
+    const eyeBack = byClass('pxs-layer-eye')[0];
+    if (eyeBack) eyeBack.props.onClick({ stopPropagation() {} });
+    await pump('layer-show');
+
+    key('m');
+    await pump('layer-select-tool');
+    pointerAt('onPointerDown', 1, 1);
+    pointerAt('onPointerMove', 4, 4);
+    pointerAt('onPointerUp', 4, 4);
+    await pump('layer-select-rect');
+    check('a rectangle is selected before the layer op',
+        byClass('pxs-selection-bar').length === 1);
+    const rowCount = rows().length;
+    await clickTitle('新建图层', 'layer-add-over-selection');
+    check('a layer change ends the running selection',
+        byClass('pxs-selection-bar').length === 0);
+    check('and it leaves the pixels alone', rows().length === rowCount);
+
     console.log(failures === 0 ? 'PASS: selection interactions behave' : `FAIL: ${failures} check(s) failed`);
     process.exit(failures === 0 ? 0 : 1);
 })().catch((error) => {

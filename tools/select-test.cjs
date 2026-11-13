@@ -566,18 +566,78 @@ const circle = shapeApi.ellipseCells(0, 0, 8, 8);
 same("the ellipse stays inside its box",
     circle.every(([x, y]) => x >= 0 && x <= 8 && y >= 0 && y <= 8),
     true);
-same("the ellipse has no gaps",
-    circle.every(([x, y], index) => {
-        if (index === 0) return true;
-        const [px, py] = circle[index - 1];
-        return Math.abs(x - px) <= 1 && Math.abs(y - py) <= 1;
-    }),
-    true);
-same("the ellipse closes the loop", (() => {
-    const [fx, fy] = circle[0];
-    const [lx, ly] = circle[circle.length - 1];
-    return Math.abs(fx - lx) <= 1 && Math.abs(fy - ly) <= 1;
+/* The midpoint walk emits cells quadrant by quadrant, so order says nothing about
+ * the ring; connectivity is what "no gaps" means here. */
+function ringStats(cells) {
+    const set = new Set(cells.map(([x, y]) => `${x},${y}`));
+    const neighboursOf = ([x, y]) => {
+        let count = 0;
+        for (let dy = -1; dy <= 1; dy += 1) {
+            for (let dx = -1; dx <= 1; dx += 1) {
+                if (dx === 0 && dy === 0) continue;
+                if (set.has(`${x + dx},${y + dy}`)) count += 1;
+            }
+        }
+        return count;
+    };
+    const start = cells[0];
+    const seen = new Set([`${start[0]},${start[1]}`]);
+    const queue = [start];
+    while (queue.length > 0) {
+        const [x, y] = queue.pop();
+        for (let dy = -1; dy <= 1; dy += 1) {
+            for (let dx = -1; dx <= 1; dx += 1) {
+                if (dx === 0 && dy === 0) continue;
+                const spot = `${x + dx},${y + dy}`;
+                if (!set.has(spot) || seen.has(spot)) continue;
+                seen.add(spot);
+                queue.push([x + dx, y + dy]);
+            }
+        }
+    }
+    return {
+        cells: cells.length,
+        reached: seen.size,
+        lonelyCells: cells.filter((cell) => neighboursOf(cell) < 2).length,
+    };
+}
+
+const circleRing = ringStats(circle);
+same("the ellipse has no gaps", circleRing.reached, circleRing.cells);
+same("every ellipse cell has a neighbour on both sides", circleRing.lonelyCells, 0);
+
+/* A thick edge reads as a doubled line once the canvas is zoomed in. ---------- */
+
+function thickSpots(shape) {
+    const cells = shapeApi.shapeCells(shape);
+    const set = new Set(cells.map(([x, y]) => `${x},${y}`));
+    const spots = [];
+    for (const [x, y] of cells) {
+        if (set.has(`${x + 1},${y}`) && set.has(`${x},${y + 1}`) && set.has(`${x + 1},${y + 1}`)) {
+            spots.push(`${x},${y}`);
+        }
+    }
+    return spots;
+}
+
+/* Very flat boxes (20x6 and the like) genuinely need a doubled cap to stay connected,
+ * so they are not in this list. */
+const ellipseSizes = [[0, 0, 6, 4], [0, 0, 8, 6], [0, 0, 12, 9], [0, 0, 25, 6], [2, 1, 7, 4], [5, 2, 9, 12], [0, 0, 31, 31]];
+same("no ellipse outline is two cells thick",
+    ellipseSizes.map(([x0, y0, x1, y1]) => thickSpots({ tool: "ellipse", x0, y0, x1, y1 })).flat(),
+    []);
+same("an ellipse outline mirrors about its centre", (() => {
+    const cells = shapeApi.ellipseCells(2, 1, 7, 4);
+    const set = new Set(cells.map(([x, y]) => `${x},${y}`));
+    return cells.every(([x, y]) => set.has(`${9 - x},${y}`) && set.has(`${x},${5 - y}`));
 })(), true);
+same("a tall ellipse outline stays connected and thin", (() => {
+    const cells = shapeApi.ellipseCells(5, 2, 9, 12);
+    return {
+        thick: thickSpots({ tool: "ellipse", x0: 5, y0: 2, x1: 9, y1: 12 }).length,
+        inside: cells.every(([x, y]) => x >= 5 && x <= 9 && y >= 2 && y <= 12),
+    };
+})(), { thick: 0, inside: true });
 
 same("rectangles normalise to left and top first",
     shapeApi.normalizeShape({ tool: "rect", x0: 5, y0: 4, x1: 2, y1: 1 }),
@@ -641,6 +701,31 @@ truthy('a filled ellipse covers its centre', ellipseFilled.some(([x, y]) => x ==
 same('a filled ellipse has no duplicates', new Set(ellipseFilled.map(([x, y]) => `${x},${y}`)).size, ellipseFilled.length);
 truthy('a one-cell ellipse still paints something',
     shapeApi.filledShapeCells({ tool: 'ellipse', x0: 3, y0: 3, x1: 3, y1: 3 }).length > 0);
+
+// The scanline fill has to stop at the drawn outline. The midpoint ring sits a cell
+// inside the curve where it turns steep, so an unclamped span pokes out one pixel.
+const leakBoxes = [[0, 0, 8, 8], [0, 0, 15, 15], [2, 1, 21, 6], [0, 0, 25, 6], [4, 4, 9, 14], [0, 0, 30, 10]];
+const leaks = [];
+for (const [x0, y0, x1, y1] of leakBoxes) {
+    const rows = new Map();
+    for (const [x, y] of shapeApi.ellipseCells(x0, y0, x1, y1)) {
+        const row = rows.get(y);
+        if (!row) rows.set(y, [x, x]);
+        else {
+            if (x < row[0]) row[0] = x;
+            if (x > row[1]) row[1] = x;
+        }
+    }
+    for (const [x, y] of shapeApi.filledShapeCells({ tool: 'ellipse', x0, y0, x1, y1 })) {
+        const row = rows.get(y);
+        if (!row || x < row[0] || x > row[1]) leaks.push([x0, y0, x1, y1, x, y]);
+    }
+}
+same('no filled cell sticks out past the ellipse outline', leaks.length, 0);
+const widestRow = shapeApi.filledShapeCells({ tool: 'ellipse', x0: 0, y0: 0, x1: 8, y1: 8 })
+    .filter(([, y]) => y === 4)
+    .map(([x]) => x);
+same('a filled ellipse fills its widest row', widestRow, [0, 1, 2, 3, 4, 5, 6, 7, 8]);
 
 if (failures > 0) {
     console.error(`FAIL: ${failures} selection assertion(s) failed`);
